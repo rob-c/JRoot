@@ -141,9 +141,29 @@ public final class X509Proxy {
                 || value.chars().allMatch(Character::isDigit) && !value.isEmpty();
     }
 
+    /** The certificates of a concatenated PEM chain, in file order. */
+    public static List<X509Certificate> parseChain(byte[] pem) {
+        List<X509Certificate> out = new ArrayList<>();
+        try {
+            CertificateFactory factory = CertificateFactory.getInstance("X.509");
+            for (byte[] der : Pem.blocks(pem, "CERTIFICATE")) {
+                out.add((X509Certificate)
+                        factory.generateCertificate(new ByteArrayInputStream(der)));
+            }
+        } catch (CertificateException e) {
+            throw new XrdAuthException("unreadable certificate chain: " + e.getMessage(), e);
+        }
+        return out;
+    }
+
     /** Whether the end-entity certificate is a proxy at all. */
     public boolean isProxy() {
-        X509Certificate cert = certificate();
+        return isProxy(certificate());
+    }
+
+    /** Whether {@code cert} is a proxy: it says so, or its subject is its
+     *  issuer's with one more name on the end, which is the pre-RFC form. */
+    public static boolean isProxy(X509Certificate cert) {
         if (hasExtension(cert, PROXY_CERT_INFO_OID) || hasExtension(cert, LEGACY_PROXY_OID)) {
             return true;
         }

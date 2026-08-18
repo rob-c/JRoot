@@ -1,14 +1,10 @@
 package io.github.robc.jroot.client;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
-import java.security.KeyStore;
 import java.security.cert.CertificateException;
-import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 
 import javax.net.ssl.KeyManager;
@@ -20,7 +16,7 @@ import javax.net.ssl.X509TrustManager;
 
 import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdConnectionException;
-import io.github.robc.jroot.crypto.Pem;
+import io.github.robc.jroot.crypto.CaStore;
 import io.github.robc.jroot.crypto.X509Proxy;
 
 /**
@@ -75,60 +71,17 @@ public final class TlsFactory {
         if (!config.verifyPeer()) {
             return new TrustManager[] {TRUST_EVERYTHING};
         }
-        Path caPath = config.caPath();
-        if (caPath == null) {
-            String env = System.getenv("X509_CERT_DIR");
-            if (env != null && !env.isBlank()) {
-                caPath = Path.of(env);
-            } else if (Files.isDirectory(Path.of("/etc/grid-security/certificates"))) {
-                caPath = Path.of("/etc/grid-security/certificates");
-            }
-        }
-        if (caPath == null || !Files.exists(caPath)) {
+        CaStore store = CaStore.discover(config.caPath());
+        if (store == null) {
             return null;                                  // the JVM's own store
         }
-        KeyStore store = KeyStore.getInstance(KeyStore.getDefaultType());
-        store.load(null, null);
-        int loaded = load(caPath, store);
-        if (loaded == 0) {
-            throw new XrdConnectionException("no CA certificate under " + caPath);
+        if (store.isEmpty()) {
+            throw new XrdConnectionException("no CA certificate under " + store.source());
         }
         TrustManagerFactory factory =
                 TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-        factory.init(store);
+        factory.init(store.keyStore());
         return factory.getTrustManagers();
-    }
-
-    private static int load(Path caPath, KeyStore store) throws IOException {
-        if (!Files.isDirectory(caPath)) {
-            return loadFile(caPath, store, 0);
-        }
-        int count = 0;
-        try (DirectoryStream<Path> entries = Files.newDirectoryStream(caPath)) {
-            for (Path entry : entries) {
-                if (Files.isRegularFile(entry)) {
-                    count = loadFile(entry, store, count);
-                }
-            }
-        }
-        return count;
-    }
-
-    private static int loadFile(Path file, KeyStore store, int count) {
-        // A CA directory holds far more than certificates - policy files,
-        // CRLs, signing_policy - so anything that will not parse is skipped
-        // rather than fatal.
-        try {
-            CertificateFactory factory = CertificateFactory.getInstance("X.509");
-            for (byte[] der : Pem.blocks(Files.readAllBytes(file), "CERTIFICATE")) {
-                X509Certificate certificate = (X509Certificate)
-                        factory.generateCertificate(new ByteArrayInputStream(der));
-                store.setCertificateEntry("ca-" + count++, certificate);
-            }
-        } catch (IOException | GeneralSecurityException | RuntimeException e) {
-            return count;
-        }
-        return count;
     }
 
     /**
