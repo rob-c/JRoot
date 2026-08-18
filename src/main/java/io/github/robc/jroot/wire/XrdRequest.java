@@ -22,13 +22,35 @@ public abstract class XrdRequest {
         return false;
     }
 
+    /**
+     * The data path this request names, or 0 for the control link. Only the
+     * bulk requests carry one, and where the byte sits differs per opcode —
+     * a {@code kXR_read} puts it in an optional payload, a {@code kXR_write}
+     * in its parameters — which is why the value is declared here and
+     * written by each encoder.
+     */
+    public int pathId() {
+        return 0;
+    }
+
     /** Write the 16 parameter bytes (header offsets 4..19). Default: all zero. */
     protected void params(WBuf w) {
         w.zeros(16);
     }
 
-    /** Bytes after the header, counted in {@code dlen}. */
+    /** Bytes after the header, counted in {@code dlen}, sent on the link the
+     *  request itself travels. */
     protected byte[] payload() {
+        return EMPTY;
+    }
+
+    /**
+     * Bytes counted in {@code dlen} but sent down the data path this request
+     * names rather than on the control link. Only {@code kXR_write} and
+     * {@code kXR_pgwrite} have any: the server reads the header, learns from
+     * {@code dlen} how much data to expect, and takes it off the bound path.
+     */
+    public byte[] pathData() {
         return EMPTY;
     }
 
@@ -44,8 +66,28 @@ public abstract class XrdRequest {
 
     private static final byte[] EMPTY = new byte[0];
 
-    /** Serialise this request into a complete wire frame for {@code streamId}. */
+    /**
+     * The whole request as one contiguous frame. This is the form a single
+     * link carries, and the form a signature covers — {@code kXR_sigver}
+     * hashes the header and the {@code dlen} bytes after it, wherever those
+     * bytes actually travel.
+     */
     public final byte[] encode(int streamId) {
+        return concat(frameHeader(streamId), payload(), pathData(), trailer());
+    }
+
+    /** What the control link carries when the data goes down a path: the
+     *  same frame without the bytes {@link #pathData()} claims. */
+    public final byte[] controlFrame(int streamId) {
+        return concat(frameHeader(streamId), payload(), EMPTY, trailer());
+    }
+
+    /**
+     * The 24-byte header alone. {@code dlen} counts the payload and the path
+     * data together, so a server reads the same number of bytes whether they
+     * arrive on one link or two.
+     */
+    public final byte[] frameHeader(int streamId) {
         WBuf pw = new WBuf();
         params(pw);
         if (pw.size() != 16) {
@@ -53,16 +95,26 @@ public abstract class XrdRequest {
                     getClass().getSimpleName() + ".params wrote " + pw.size()
                             + " bytes, expected 16");
         }
-        byte[] body = payload();
-        byte[] tail = trailer();
         return new WBuf()
                 .u16(streamId)
                 .u16(opcode())
                 .raw(pw.bytes())
-                .i32(body.length)
-                .raw(body)
-                .raw(tail)
+                .i32(payload().length + pathData().length)
                 .bytes();
+    }
+
+    private static byte[] concat(byte[]... parts) {
+        int total = 0;
+        for (byte[] part : parts) {
+            total += part.length;
+        }
+        byte[] out = new byte[total];
+        int at = 0;
+        for (byte[] part : parts) {
+            System.arraycopy(part, 0, out, at, part.length);
+            at += part.length;
+        }
+        return out;
     }
 
     @Override

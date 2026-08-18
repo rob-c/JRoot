@@ -434,47 +434,81 @@ public final class Requests {
         }
     }
 
-    /** {@code kXR_read}. */
+    /**
+     * {@code kXR_read}. A non-zero {@code pathid} asks the server to send the
+     * data down that bound path instead of the control link; the id travels
+     * in an optional {@code read_args} payload the server only reads when
+     * {@code dlen} says it is there.
+     */
     public static final class Read extends XrdRequest {
         private final byte[] fhandle;
         private final long offset;
         private final int length;
+        private final int pathid;
 
         public Read(byte[] fhandle, long offset, int length) {
+            this(fhandle, offset, length, 0);
+        }
+
+        public Read(byte[] fhandle, long offset, int length, int pathid) {
             this.fhandle = fhandle;
             this.offset = offset;
             this.length = length;
+            this.pathid = pathid;
         }
 
         @Override public int opcode() { return kXR_read; }
 
+        @Override public int pathId() { return pathid; }
+
         @Override protected void params(WBuf w) {
             w.padded(fhandle, 4).i64(offset).i32(length);
         }
+
+        @Override protected byte[] payload() {
+            // read_args: pathid[1] reserved[7].
+            return pathid == 0 ? new byte[0] : new WBuf().u8(pathid).zeros(7).bytes();
+        }
     }
 
-    /** {@code kXR_write}. */
+    /**
+     * {@code kXR_write}. With a non-zero {@code pathid} the header goes out
+     * on the control link and the data down that path, which is what makes a
+     * multi-stream write faster than a single-socket one.
+     */
     public static final class Write extends XrdRequest {
         private final byte[] fhandle;
         private final long offset;
         private final byte[] data;
+        private final int pathid;
 
         public Write(byte[] fhandle, long offset, byte[] data) {
+            this(fhandle, offset, data, 0);
+        }
+
+        public Write(byte[] fhandle, long offset, byte[] data, int pathid) {
             this.fhandle = fhandle;
             this.offset = offset;
             this.data = data;
+            this.pathid = pathid;
         }
 
         @Override public int opcode() { return kXR_write; }
 
         @Override public boolean signed() { return true; }
 
+        @Override public int pathId() { return pathid; }
+
         @Override protected void params(WBuf w) {
-            w.padded(fhandle, 4).i64(offset).zeros(4);
+            w.padded(fhandle, 4).i64(offset).u8(pathid).zeros(3);
         }
 
         @Override protected byte[] payload() {
-            return data;
+            return pathid == 0 ? data : new byte[0];
+        }
+
+        @Override public byte[] pathData() {
+            return pathid == 0 ? new byte[0] : data;
         }
     }
 
@@ -499,16 +533,28 @@ public final class Requests {
     /** {@code kXR_readv} — many scattered ranges in one round trip. */
     public static final class ReadV extends XrdRequest {
         private final List<Segment> segments;
+        private final int pathid;
 
         public ReadV(List<Segment> segments) {
+            this(segments, 0);
+        }
+
+        public ReadV(List<Segment> segments, int pathid) {
             if (segments.size() > VEC_MAXSEGS) {
                 throw new IllegalArgumentException(
                         segments.size() + " segments exceeds the readv cap of " + VEC_MAXSEGS);
             }
             this.segments = List.copyOf(segments);
+            this.pathid = pathid;
         }
 
         @Override public int opcode() { return kXR_readv; }
+
+        @Override public int pathId() { return pathid; }
+
+        @Override protected void params(WBuf w) {
+            w.zeros(15).u8(pathid);
+        }
 
         @Override protected byte[] payload() {
             // readahead_list: fhandle[4] rlen[4] roffset[8], per segment.
@@ -587,23 +633,125 @@ public final class Requests {
         private final byte[] fhandle;
         private final long offset;
         private final byte[] packed;
+        private final int reqflags;
+        private final int pathid;
 
         public PgWrite(byte[] fhandle, long offset, byte[] packed) {
+            this(fhandle, offset, packed, 0, 0);
+        }
+
+        /** {@code reqflags} carries {@code kXR_pgRetry} when this resends a
+         *  page the server reported corrupt. */
+        public PgWrite(byte[] fhandle, long offset, byte[] packed, int reqflags, int pathid) {
             this.fhandle = fhandle;
             this.offset = offset;
             this.packed = packed;
+            this.reqflags = reqflags;
+            this.pathid = pathid;
         }
 
         @Override public int opcode() { return kXR_pgwrite; }
 
         @Override public boolean signed() { return true; }
 
+        @Override public int pathId() { return pathid; }
+
         @Override protected void params(WBuf w) {
-            w.padded(fhandle, 4).i64(offset).zeros(4);
+            w.padded(fhandle, 4).i64(offset).u8(pathid).u8(reqflags).zeros(2);
         }
 
         @Override protected byte[] payload() {
-            return packed;
+            return pathid == 0 ? packed : new byte[0];
+        }
+
+        @Override public byte[] pathData() {
+            return pathid == 0 ? new byte[0] : packed;
+        }
+    }
+
+    /**
+     * {@code kXR_gpfile} — the "get/put file" request, encoded so the opcode
+     * is reachable rather than merely named.
+     *
+     * <p>No server implements it: the upstream header declares the request
+     * broken, and a server that receives it answers {@code kXR_Unsupported}.
+     * A server that ever does implement it can be talked to without a patch,
+     * which is the only reason this is here; {@link ReadV} is what the
+     * operation's purpose became.
+     */
+    public static final class GpFile extends XrdRequest {
+        private final String path;
+        private final int options;
+        private final int buffsz;
+
+        public GpFile(String path, int options, int buffsz) {
+            this.path = path;
+            this.options = options;
+            this.buffsz = buffsz;
+        }
+
+        @Override public int opcode() { return kXR_gpfile; }
+
+        @Override public boolean signed() { return true; }
+
+        @Override protected void params(WBuf w) {
+            w.i32(options).zeros(8).i32(buffsz);
+        }
+
+        @Override protected byte[] payload() {
+            return utf8(path);
+        }
+    }
+
+    /** One range a {@link Clone} copies, server-side, from one open file to
+     *  another. */
+    public record CloneItem(byte[] fhandle, long srcOffset, long length, long dstOffset) {}
+
+    /**
+     * {@code kXR_clone} — copy ranges between two files already open on this
+     * connection, without the bytes crossing the client.
+     *
+     * <p>This is <em>not</em> a stock XRootD request. {@code XProtocol.hh}
+     * ends its opcode table at {@code kXR_writev} (3031) with 3032 as
+     * {@code kXR_REQFENCE}; {@code kXR_clone} is an nginx-xrootd extension
+     * sitting in the first slot past that fence, and a stock server answers
+     * it with {@code kXR_InvalidRequest}.
+     */
+    public static final class Clone extends XrdRequest {
+        private final byte[] dstFhandle;
+        private final List<CloneItem> items;
+
+        public Clone(byte[] dstFhandle, List<CloneItem> items) {
+            if (items.isEmpty() || items.size() > CLONE_MAXITEMS) {
+                throw new IllegalArgumentException("a clone carries 1.." + CLONE_MAXITEMS
+                        + " items, not " + items.size());
+            }
+            for (CloneItem item : items) {
+                if (item.srcOffset() < 0 || item.length() < 0 || item.dstOffset() < 0) {
+                    throw new IllegalArgumentException(
+                            "a clone item cannot have a negative offset or length");
+                }
+            }
+            this.dstFhandle = dstFhandle;
+            this.items = List.copyOf(items);
+        }
+
+        @Override public int opcode() { return kXR_clone; }
+
+        @Override public boolean signed() { return true; }
+
+        @Override protected void params(WBuf w) {
+            w.padded(dstFhandle, 4).zeros(12);
+        }
+
+        @Override protected byte[] payload() {
+            // src_fhandle[4] reserved[4] src_offset[8] src_len[8] dst_offset[8]
+            WBuf w = new WBuf();
+            for (CloneItem item : items) {
+                w.padded(item.fhandle(), 4).zeros(4)
+                        .i64(item.srcOffset()).i64(item.length()).i64(item.dstOffset());
+            }
+            return w.bytes();
         }
     }
 

@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,10 +63,13 @@ import io.github.robc.jroot.wire.XrdRequest;
  */
 public final class XrdConnection implements Closeable {
 
-    /** Stream ids 0-3 belong to bring-up; regular traffic starts above them. */
+    /** Stream ids 0-3 belong to bring-up; regular traffic starts above them.
+     *  A data path's own bring-up reuses them: it is the same conversation,
+     *  on a socket that has no traffic of its own yet. */
     private static final int HANDSHAKE_SID = 0;
     private static final int PROTOCOL_SID = 1;
     private static final int LOGIN_SID = 2;
+    private static final int BIND_SID = LOGIN_SID;
     private static final int AUTH_SID = 3;
     private static final int FIRST_SID = 4;
     private static final int MAX_SID = 0xFFFF;
@@ -74,10 +78,14 @@ public final class XrdConnection implements Closeable {
      *  frames, so a server that never says "done" cannot exhaust the heap. */
     private static final long MAX_ACCUMULATED = 1L << 30;
 
+    private static final byte[] EMPTY = new byte[0];
+
     private final XrdUrl url;
     private final Config config;
     private final Map<Integer, Stream> streams = new ConcurrentHashMap<>();
+    private final Map<Integer, DataPath> paths = new ConcurrentHashMap<>();
     private final Object writeLock = new Object();
+    private final Object bindLock = new Object();
 
     private Socket socket;
     private InputStream in;
@@ -94,6 +102,8 @@ public final class XrdConnection implements Closeable {
     private String mechanism = "";
     private boolean tls;
     private int serverType;
+    private boolean pathsBound;
+    private volatile String pathRefusal = "";
 
     private XrdConnection(XrdUrl url, Config config) {
         this.url = url;
@@ -162,13 +172,23 @@ public final class XrdConnection implements Closeable {
     }
 
     private void connectSocket() {
+        socket = connect();
         try {
-            socket = new Socket();
-            socket.setTcpNoDelay(true);
-            socket.connect(new InetSocketAddress(url.host(), url.port()),
-                    (int) config.connectTimeout().toMillis());
             in = socket.getInputStream();
             out = socket.getOutputStream();
+        } catch (IOException e) {
+            throw new XrdConnectionException(
+                    "cannot connect to " + url.host() + ":" + url.port() + ": " + e.getMessage(), e);
+        }
+    }
+
+    private Socket connect() {
+        try {
+            Socket plain = new Socket();
+            plain.setTcpNoDelay(true);
+            plain.connect(new InetSocketAddress(url.host(), url.port()),
+                    (int) config.connectTimeout().toMillis());
+            return plain;
         } catch (IOException e) {
             throw new XrdConnectionException(
                     "cannot connect to " + url.host() + ":" + url.port() + ": " + e.getMessage(), e);
@@ -208,18 +228,30 @@ public final class XrdConnection implements Closeable {
         if (!protocol.hasTls()) {
             throw new XrdConnectionException(url.host() + " does not offer TLS");
         }
+        SSLSocket ssl = wrapInTls(socket);
+        socket = ssl;
+        try {
+            in = ssl.getInputStream();
+            out = ssl.getOutputStream();
+        } catch (IOException e) {
+            throw new XrdConnectionException(
+                    "TLS with " + url.host() + " left no usable stream: " + e.getMessage(), e);
+        }
+        tls = true;
+    }
+
+    /** Put an already-connected socket inside TLS, in place, as the protocol's
+     *  in-band upgrade does. */
+    private SSLSocket wrapInTls(Socket plain) {
         try {
             SSLSocket ssl = (SSLSocket) TlsFactory.create(config).getSocketFactory()
-                    .createSocket(socket, url.host(), url.port(), true);
+                    .createSocket(plain, url.host(), url.port(), true);
             ssl.setUseClientMode(true);
             SSLParameters parameters = ssl.getSSLParameters();
             parameters.setEndpointIdentificationAlgorithm(config.verifyPeer() ? "HTTPS" : null);
             ssl.setSSLParameters(parameters);
             ssl.startHandshake();
-            socket = ssl;
-            in = ssl.getInputStream();
-            out = ssl.getOutputStream();
-            tls = true;
+            return ssl;
         } catch (IOException e) {
             throw new XrdConnectionException(
                     "TLS handshake with " + url.host() + " failed: " + e.getMessage(), e);
@@ -229,7 +261,7 @@ public final class XrdConnection implements Closeable {
     private List<SecurityOffer> doLogin() {
         String username = !url.user().isEmpty() ? url.user() : config.username();
         int pid = (int) ProcessHandle.current().pid();
-        ServerResponse response = request(LOGIN_SID, new Requests.Login(username, pid, ""));
+        ServerResponse response = request(LOGIN_SID, new Requests.Login(username, pid, ""), config.requestTimeout());
         login = Responses.parseLogin(response.data());
         return SecurityOffer.parse(login.sec());
     }
@@ -265,7 +297,8 @@ public final class XrdConnection implements Closeable {
         byte[] blob = credential.initial();
         for (int round = 0; round < 32; round++) {
             ServerResponse response =
-                    request(AUTH_SID, new Requests.Auth(credential.name(), blob));
+                    request(AUTH_SID, new Requests.Auth(credential.name(), blob),
+                            config.requestTimeout());
             if (response.status() != XrdConst.kXR_authmore) {
                 return;
             }
@@ -300,15 +333,24 @@ public final class XrdConnection implements Closeable {
      * a redirect as {@link XrdRedirectException}.
      */
     public ServerResponse request(XrdRequest request) {
-        return request(-1, request);
+        return request(-1, request, config.requestTimeout());
     }
 
-    private ServerResponse request(int fixedSid, XrdRequest request) {
-        long deadline = System.nanoTime() + config.requestTimeout().toNanos();
+    /**
+     * The same, for a request the server is expected to sit on far longer
+     * than an ordinary one — the second {@code kXR_sync} of a third-party
+     * copy does not answer until the whole transfer has finished.
+     */
+    public ServerResponse request(XrdRequest request, Duration timeout) {
+        return request(-1, request, timeout);
+    }
+
+    private ServerResponse request(int fixedSid, XrdRequest request, Duration timeout) {
+        long deadline = System.nanoTime() + timeout.toNanos();
         while (true) {
             ServerResponse response = fixedSid >= 0
                     ? sendSync(fixedSid, request)
-                    : sendMultiplexed(request);
+                    : sendMultiplexed(request, timeout);
             if (response.status() != XrdConst.kXR_wait) {
                 return response;
             }
@@ -326,26 +368,25 @@ public final class XrdConnection implements Closeable {
 
     /** Bring-up path: no reader thread yet, so the answer is read here. */
     private ServerResponse sendSync(int sid, XrdRequest request) {
-        write(sign(sid, request));
+        transmit(sid, request);
         return readSync(sid, request);
     }
 
-    private ServerResponse sendMultiplexed(XrdRequest request) {
+    private ServerResponse sendMultiplexed(XrdRequest request, Duration timeout) {
         Stream stream = newStream();
         try {
-            write(sign(stream.id, request));
-            return await(stream);
+            transmit(stream.id, request);
+            return await(stream, timeout);
         } finally {
             streams.remove(stream.id);
         }
     }
 
-    private ServerResponse await(Stream stream) {
+    private ServerResponse await(Stream stream, Duration timeout) {
         try {
-            return stream.future.get(config.requestTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            return stream.future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            throw new XrdConnectionException(url.host() + " did not answer within "
-                    + config.requestTimeout());
+            throw new XrdConnectionException(url.host() + " did not answer within " + timeout);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new XrdConnectionException("interrupted waiting for " + url.host(), e);
@@ -359,32 +400,75 @@ public final class XrdConnection implements Closeable {
         }
     }
 
-    /** The frame to put on the wire, with its {@code kXR_sigver} prefix when
-     *  the security level calls for one. */
-    private byte[] sign(int sid, XrdRequest request) {
-        byte[] frame = request.encode(sid);
+    /**
+     * Put a request on the wire.
+     *
+     * <p>A request naming a bound data path is split: the header goes out on
+     * the control link and the bulk bytes down the path, which is what the
+     * server expects when it reads {@code dlen} from a header that arrived
+     * on one socket and the data from another. The path's lock is taken
+     * first and held across both writes, because the server pairs the
+     * <em>n</em>th header naming a path with the <em>n</em>th block of bytes
+     * on it; the control link is locked only for the header, so requests on
+     * different paths stream their data at the same time, which is the whole
+     * point of having them. The order is always path then control, and a
+     * request without a path takes only the control lock, so the two can
+     * never deadlock.
+     *
+     * <p>Signing happens here rather than at the call site so that a
+     * signature, its sequence number and the request it covers cannot be
+     * interleaved with another thread's.
+     */
+    private void transmit(int sid, XrdRequest request) {
+        DataPath path = pathFor(request);
+        if (path == null) {
+            synchronized (writeLock) {
+                writeTo(out, signature(sid, request), request.encode(sid));
+            }
+            return;
+        }
+        synchronized (path.writeLock) {
+            synchronized (writeLock) {
+                writeTo(out, signature(sid, request), request.controlFrame(sid));
+            }
+            writeTo(path.out, EMPTY, request.pathData());
+        }
+    }
+
+    /**
+     * The {@code kXR_sigver} frame that must precede {@code request}, or no
+     * bytes when the security level does not call for one. The signature
+     * covers the request as one contiguous frame even when it is about to be
+     * split across two sockets: {@code dlen} counts the same bytes either way.
+     */
+    private byte[] signature(int sid, XrdRequest request) {
         if (signer == null) {
-            return frame;
+            return EMPTY;
         }
-        Signer.Signature signature = signer.sign(frame);
+        Signer.Signature signature = signer.sign(request.encode(sid));
         if (signature == null) {
-            return frame;
+            return EMPTY;
         }
-        return concat(new Requests.Sigver(request.opcode(), signature.sequence(),
-                signature.bytes(), signature.nodata()).encode(sid), frame);
+        return new Requests.Sigver(request.opcode(), signature.sequence(),
+                signature.bytes(), signature.nodata()).encode(sid);
     }
 
     private void write(byte[] frame) {
-        // The signature and its request must stay adjacent and in
-        // sequence-number order, so signing happens under this lock too.
         synchronized (writeLock) {
-            try {
-                out.write(frame);
-                out.flush();
-            } catch (IOException e) {
-                throw fail(new XrdConnectionException(
-                        "writing to " + url.host() + " failed: " + e.getMessage(), e));
+            writeTo(out, EMPTY, frame);
+        }
+    }
+
+    private void writeTo(OutputStream sink, byte[] first, byte[] second) {
+        try {
+            if (first.length > 0) {
+                sink.write(first);
             }
+            sink.write(second);
+            sink.flush();
+        } catch (IOException e) {
+            throw fail(new XrdConnectionException(
+                    "writing to " + url.host() + " failed: " + e.getMessage(), e));
         }
     }
 
@@ -406,24 +490,191 @@ public final class XrdConnection implements Closeable {
     }
 
     // -----------------------------------------------------------------
+    // Data paths
+    // -----------------------------------------------------------------
+
+    /**
+     * One extra TCP stream bound to this session.
+     *
+     * <p>It carries no session of its own: the {@code kXR_bind} that created
+     * it named the control link's session id, so the server treats the two
+     * sockets as one client. Responses on it carry the control link's stream
+     * ids and land in the same table, which is why a caller cannot tell
+     * which socket answered — and does not need to.
+     */
+    private static final class DataPath {
+        private final int pathid;
+        private final Socket socket;
+        private final InputStream in;
+        private final OutputStream out;
+        private final Object writeLock = new Object();
+
+        DataPath(int pathid, Socket socket, InputStream in, OutputStream out) {
+            this.pathid = pathid;
+            this.socket = socket;
+            this.in = in;
+            this.out = out;
+        }
+    }
+
+    /** The data paths bound to this session, lowest id first. Empty when the
+     *  session runs on the control link alone. */
+    public int[] dataPaths() {
+        return paths.keySet().stream().mapToInt(Integer::intValue).sorted().toArray();
+    }
+
+    /** Why binding stopped short of what the configuration asked for, or
+     *  {@code ""} when it did not. */
+    public String pathRefusal() {
+        return pathRefusal;
+    }
+
+    /**
+     * Bring this session up to {@link Config#dataStreams()} TCP streams,
+     * once. Called when a file is opened rather than at login, so a session
+     * that only ever stats a path never pays for sockets it will not use.
+     *
+     * <p>An extra stream is an optimisation, not a requirement: a server that
+     * refuses to bind one leaves the session working on the control link, and
+     * says so through {@link #pathRefusal()}.
+     */
+    public void ensureDataPaths() {
+        if (pathsBound || config.dataStreams() <= 1) {
+            return;
+        }
+        synchronized (bindLock) {
+            if (pathsBound) {
+                return;
+            }
+            pathsBound = true;
+            for (int stream = 1; stream < config.dataStreams(); stream++) {
+                if (!bindDataPath()) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * A second socket to the same server, brought up to the point where the
+     * session owns it: handshake and {@code kXR_protocol} as the control link
+     * ran them, the same TLS the control link is inside, then
+     * {@code kXR_bind} naming the session id. There is no login and no
+     * authentication — the session id is the credential.
+     */
+    private boolean bindDataPath() {
+        if (login == null || !isOpen()) {
+            return false;
+        }
+        Socket bound = null;
+        try {
+            bound = connect();
+            InputStream bin = bound.getInputStream();
+            OutputStream bout = bound.getOutputStream();
+
+            int flags = XrdConst.kXR_secreqs | XrdConst.kXR_ableTLS
+                    | (tls ? XrdConst.kXR_wantTLS : 0);
+            writeTo(bout, XrdRequest.HANDSHAKE,
+                    new Requests.Protocol(flags).encode(PROTOCOL_SID));
+            readBindFrame(bin, HANDSHAKE_SID);                  // ServerInitHandShake
+            ProtocolInfo answer = Responses.parseProtocol(readBindFrame(bin, PROTOCOL_SID));
+            if (tls || answer.demandsTls()) {
+                SSLSocket ssl = wrapInTls(bound);
+                bound = ssl;
+                bin = ssl.getInputStream();
+                bout = ssl.getOutputStream();
+            }
+
+            writeTo(bout, EMPTY, new Requests.Bind(login.sessionId()).encode(BIND_SID));
+            int pathid = Responses.parseBind(readBindFrame(bin, BIND_SID));
+            if (paths.containsKey(pathid)) {
+                throw new XrdProtocolException(url.host() + " bound path id " + pathid
+                        + " twice; one of the two would take the other's data");
+            }
+            DataPath path = new DataPath(pathid, bound, bin, bout);
+            // Registered before its reader starts: a request may name the path
+            // as soon as this returns, and the reader only ever reads.
+            paths.put(pathid, path);
+            daemon(() -> readLoop(path.in, "data path " + pathid),
+                    "jroot-" + url.host() + ":" + url.port() + "-path" + pathid);
+            return true;
+        } catch (IOException | XrdException e) {
+            pathRefusal = e.getMessage();
+            closeQuietly(bound);
+            return false;
+        }
+    }
+
+    /** A data path's bring-up reads, before anything is multiplexed on it. */
+    private byte[] readBindFrame(InputStream source, int sid) throws IOException {
+        while (true) {
+            ResponseHeader header = ResponseHeader.decode(
+                    readFully(source, XrdConst.RESPONSE_HDRLEN));
+            byte[] body = readFully(source, header.dataLength());
+            if (header.status() == XrdConst.kXR_attn) {
+                continue;                           // advisory: nothing is in flight yet
+            }
+            if (header.streamId() != sid) {
+                throw new XrdProtocolException(url.host() + " answered stream "
+                        + header.streamId() + " while binding a data path");
+            }
+            switch (header.status()) {
+                case XrdConst.kXR_ok -> {
+                    return body;
+                }
+                case XrdConst.kXR_error -> {
+                    Responses.ErrorInfo error = Responses.parseError(body);
+                    throw new XrdServerException(error.code(), error.message());
+                }
+                default -> throw new XrdProtocolException("unexpected "
+                        + XrdConst.statusName(header.status()) + " while binding a data path to "
+                        + url.host());
+            }
+        }
+    }
+
+    /** The path a request names, or {@code null} for the control link. */
+    private DataPath pathFor(XrdRequest request) {
+        int pathid = request.pathId();
+        if (pathid == 0) {
+            return null;
+        }
+        DataPath path = paths.get(pathid);
+        if (path == null) {
+            // Not an assertion failure: a caller can hold an id from before a
+            // redirect replaced the session that bound it.
+            throw new XrdConnectionException("no data path " + pathid
+                    + " is bound to the session with " + url.host());
+        }
+        return path;
+    }
+
+    // -----------------------------------------------------------------
     // Reading
     // -----------------------------------------------------------------
 
     private void startReader() {
-        reader = new Thread(this::readLoop, "jroot-" + url.host() + ":" + url.port());
-        reader.setDaemon(true);
-        reader.start();
+        reader = daemon(() -> readLoop(in, "connection"),
+                "jroot-" + url.host() + ":" + url.port());
     }
 
-    private void readLoop() {
+    private static Thread daemon(Runnable body, String name) {
+        Thread thread = new Thread(body, name);
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    private void readLoop(InputStream source, String what) {
         try {
             while (!closed) {
-                ResponseHeader header = ResponseHeader.decode(readFully(XrdConst.RESPONSE_HDRLEN));
-                dispatch(header, readFully(header.dataLength()));
+                ResponseHeader header =
+                        ResponseHeader.decode(readFully(source, XrdConst.RESPONSE_HDRLEN));
+                dispatch(source, header, readFully(source, header.dataLength()));
             }
         } catch (IOException e) {
             if (!closed) {
-                fail(new XrdConnectionException("the connection to " + url.host()
+                fail(new XrdConnectionException("the " + what + " to " + url.host()
                         + " ended: " + e.getMessage(), e));
             }
         } catch (XrdException e) {
@@ -433,9 +684,10 @@ public final class XrdConnection implements Closeable {
         }
     }
 
-    private void dispatch(ResponseHeader header, byte[] body) throws IOException {
+    private void dispatch(InputStream source, ResponseHeader header, byte[] body)
+            throws IOException {
         if (header.status() == XrdConst.kXR_attn) {
-            attention(body);
+            attention(source, body);
             return;
         }
         Stream stream = streams.get(header.streamId());
@@ -463,7 +715,7 @@ public final class XrdConnection implements Closeable {
             }
             case XrdConst.kXR_redirect -> stream.future.completeExceptionally(
                     new XrdRedirectException(Responses.parseRedirect(body)));
-            case XrdConst.kXR_status -> status(stream, body);
+            case XrdConst.kXR_status -> status(source, stream, body);
             default -> stream.future.completeExceptionally(new XrdProtocolException(
                     "unknown response status " + header.status() + " from " + url.host()));
         }
@@ -474,10 +726,10 @@ public final class XrdConnection implements Closeable {
      * {@code dlen} counts raw data travelling <em>after</em> the frame,
      * outside the response header's length.
      */
-    private void status(Stream stream, byte[] body) throws IOException {
+    private void status(InputStream source, Stream stream, byte[] body) throws IOException {
         StatusInfo info = Responses.parseStatus(body);
         verifyStatusCrc(body, info);
-        byte[] data = readFully(info.dataLength());
+        byte[] data = readFully(source, info.dataLength());
         stream.accumulate(data);
         if (stream.status == null) {
             stream.status = info;
@@ -504,7 +756,7 @@ public final class XrdConnection implements Closeable {
      * {@code kXR_asynresp}, which carries a complete response for a request
      * still in flight; everything else is advisory and dropped.
      */
-    private void attention(byte[] body) throws IOException {
+    private void attention(InputStream source, byte[] body) throws IOException {
         RBuf r = new RBuf(body, "kXR_attn");
         int action = r.i32();
         if (action != XrdConst.kXR_asynresp) {
@@ -516,7 +768,7 @@ public final class XrdConnection implements Closeable {
         byte[] payload = new byte[Math.min(header.dataLength(),
                 Math.max(embedded.length - XrdConst.RESPONSE_HDRLEN, 0))];
         System.arraycopy(embedded, XrdConst.RESPONSE_HDRLEN, payload, 0, payload.length);
-        dispatch(header, payload);
+        dispatch(source, header, payload);
     }
 
     /** Bring-up reads: the reader thread is not running yet. */
@@ -526,8 +778,8 @@ public final class XrdConnection implements Closeable {
         try {
             while (true) {
                 ResponseHeader header =
-                        ResponseHeader.decode(readFully(XrdConst.RESPONSE_HDRLEN));
-                byte[] body = readFully(header.dataLength());
+                        ResponseHeader.decode(readFully(in, XrdConst.RESPONSE_HDRLEN));
+                byte[] body = readFully(in, header.dataLength());
                 if (header.streamId() != sid) {
                     if (header.status() == XrdConst.kXR_attn) {
                         continue;               // advisory: nothing is in flight yet
@@ -554,7 +806,7 @@ public final class XrdConnection implements Closeable {
                                     + " asked for " + wait.seconds() + "s before logging in");
                         }
                         sleep(wait.seconds());
-                        write(sign(sid, request));
+                        transmit(sid, request);
                     }
                     case XrdConst.kXR_error -> {
                         Responses.ErrorInfo error = Responses.parseError(body);
@@ -573,11 +825,11 @@ public final class XrdConnection implements Closeable {
         }
     }
 
-    private byte[] readFully(int length) throws IOException {
+    private byte[] readFully(InputStream source, int length) throws IOException {
         byte[] out = new byte[length];
         int read = 0;
         while (read < length) {
-            int n = in.read(out, read, length - read);
+            int n = source.read(out, read, length - read);
             if (n < 0) {
                 throw new EOFException(url.host() + " closed the connection");
             }
@@ -608,19 +860,27 @@ public final class XrdConnection implements Closeable {
 
     private void closeQuietly() {
         closed = true;
-        try {
-            if (socket != null) {
-                socket.close();
-            }
-        } catch (IOException e) {
-            // Closing a socket that is already gone is not news.
+        closeQuietly(socket);
+        for (DataPath path : paths.values()) {
+            closeQuietly(path.socket);
         }
+        paths.clear();
         XrdException reason = failure != null ? failure
                 : new XrdConnectionException("the connection to " + url.host() + " was closed");
         for (Stream stream : streams.values()) {
             stream.future.completeExceptionally(reason);
         }
         streams.clear();
+    }
+
+    private static void closeQuietly(Socket doomed) {
+        try {
+            if (doomed != null) {
+                doomed.close();
+            }
+        } catch (IOException e) {
+            // Closing a socket that is already gone is not news.
+        }
     }
 
     private XrdException fail(XrdException reason) {
@@ -648,8 +908,10 @@ public final class XrdConnection implements Closeable {
 
     @Override
     public String toString() {
+        int extra = paths.size();
         return "XrdConnection[" + url.serverKey() + (tls ? ", tls" : "")
-                + (mechanism.isEmpty() ? "" : ", " + mechanism) + "]";
+                + (mechanism.isEmpty() ? "" : ", " + mechanism)
+                + (extra == 0 ? "" : ", " + (extra + 1) + " streams") + "]";
     }
 
     /** One in-flight request. */

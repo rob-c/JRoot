@@ -89,6 +89,9 @@ public final class Cli {
                     case "--tls" -> config = config.withTls(
                             tlsMode(value != null ? value : args[++i]));
                     case "--no-verify" -> config = config.withVerifyPeer(false);
+                    case "--delegate" -> config = config.withDelegateProxy(true);
+                    case "--streams" -> config = config.withDataStreams(
+                            Integer.parseInt(value != null ? value : args[++i]));
                     case "--timeout" -> config = config.withRequestTimeout(
                             Duration.ofSeconds(Long.parseLong(value != null ? value : args[++i])));
                     default -> {
@@ -340,7 +343,7 @@ public final class Cli {
                   get URL [DEST]         download a file
                   put FILE URL           upload a file
                   cp SOURCE DEST         copy between any two URLs
-                  tpc SOURCE DEST        server-to-server copy       (http only)
+                  tpc SOURCE DEST        server-to-server copy
                   rm URL...              remove files
                   mkdir URL...           create directories
                   rmdir URL...           remove directories
@@ -368,7 +371,9 @@ public final class Cli {
                   --user NAME            the login name to present
                   --tls auto|require|off when to turn on TLS
                   --no-verify            do not verify the server certificate
+                  --delegate             sign a proxy for a server that asks
                   --timeout SECONDS      how long one request may take
+                  --streams N            TCP streams per root:// session (default 1)
                   -d, --debug            print stack traces
                   -V, --version          print the version
                   -h, --help             this text

@@ -283,12 +283,17 @@ class JRootTest {
     }
 
     @Test
-    void refusesAThirdPartyCopyThatIsNotHttpAtBothEnds() {
+    void refusesAThirdPartyCopyBetweenTwoDifferentProtocols() {
+        // The two arrangements share nothing, so there is no copy to make
+        // between them - only an ordinary one through this process.
         XrdException failure = assertThrows(XrdException.class,
                 () -> jroot.thirdPartyCopy("root://door//store/f", "https://other/store/f"));
-        assertTrue(failure.getMessage().contains("HTTP URL at both ends"));
+        assertTrue(failure.getMessage().contains("two servers of the same"),
+                failure.getMessage());
         assertThrows(XrdException.class,
                 () -> jroot.thirdPartyCopy("https://door/store/f", dir.resolve("f").toString()));
+        assertThrows(XrdException.class,
+                () -> jroot.thirdPartyCopy(dir.resolve("a").toString(), dir.resolve("b").toString()));
     }
 
     @Test

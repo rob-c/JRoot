@@ -3,7 +3,13 @@ package io.github.robc.jroot.client;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdException;
 import io.github.robc.jroot.wire.PagedIo;
 import io.github.robc.jroot.wire.Requests;
@@ -62,11 +68,32 @@ public final class XrdFile implements Closeable {
 
     /** Read {@code length} bytes at {@code offset}; short at end of file. */
     public byte[] read(long offset, int length) {
+        return read(offset, length, 0);
+    }
+
+    /**
+     * The same, answered on the bound data path {@code pathid} instead of the
+     * control link. Zero is the control link; anything else must be an id
+     * this session's {@link #streams()} lists.
+     */
+    public byte[] read(long offset, int length, int pathid) {
         check();
         if (length < 0) {
             throw new IllegalArgumentException("cannot read " + length + " bytes");
         }
-        return connection.request(new Requests.Read(fhandle, offset, length)).data();
+        return connection.request(new Requests.Read(fhandle, offset, length, pathid)).data();
+    }
+
+    /**
+     * The path ids this file's session can spread a transfer over, the
+     * control link's zero first. A single-element array means one socket,
+     * which is the default and what {@link Config#dataStreams()} raises.
+     */
+    public int[] streams() {
+        int[] paths = connection.dataPaths();
+        int[] all = new int[paths.length + 1];
+        System.arraycopy(paths, 0, all, 1, paths.length);
+        return all;
     }
 
     /** Read the whole file, in {@code chunk}-sized requests. */
@@ -76,22 +103,96 @@ public final class XrdFile implements Closeable {
             throw new XrdException(path() + " is " + size
                     + " bytes, too large to hold in one array");
         }
-        byte[] out = new byte[(int) size];
-        int filled = 0;
-        while (filled < out.length) {
-            byte[] part = read(filled, Math.min(chunk, out.length - filled));
-            if (part.length == 0) {
-                break;                              // the file shrank under us
-            }
-            System.arraycopy(part, 0, out, filled, part.length);
-            filled += part.length;
+        return readAcross(0, (int) size, chunk);
+    }
+
+    /**
+     * Read a range in {@code chunk}-sized requests spread over every stream
+     * the session has, one request in flight per stream. The bytes of a read
+     * come back down the stream its request named, so with several bound
+     * paths several sockets fill different parts of the answer at once —
+     * which is what a long fat network needs and a single stream cannot give.
+     *
+     * <p>With one stream this is the same loop without the threads. Either
+     * way the result is short if the file ends inside the range.
+     */
+    public byte[] readAcross(long offset, int length, int chunk) {
+        check();
+        if (length < 0) {
+            throw new IllegalArgumentException("cannot read " + length + " bytes");
         }
+        if (chunk <= 0) {
+            throw new IllegalArgumentException("a chunk of " + chunk + " bytes reads nothing");
+        }
+        byte[] out = new byte[length];
+        int[] streams = streams();
+        int filled = streams.length == 1 || length <= chunk
+                ? readSerially(out, offset, chunk)
+                : readConcurrently(out, offset, chunk, streams);
         if (filled == out.length) {
             return out;
         }
         byte[] trimmed = new byte[filled];
         System.arraycopy(out, 0, trimmed, 0, filled);
         return trimmed;
+    }
+
+    /** How many bytes of {@code out} were filled before the file ended. */
+    private int readSerially(byte[] out, long offset, int chunk) {
+        int filled = 0;
+        while (filled < out.length) {
+            byte[] part = read(offset + filled, Math.min(chunk, out.length - filled));
+            if (part.length == 0) {
+                break;                              // the file shrank under us
+            }
+            System.arraycopy(part, 0, out, filled, part.length);
+            filled += part.length;
+        }
+        return filled;
+    }
+
+    /**
+     * The same, with one chunk in flight per stream. A chunk that comes back
+     * short is the end of the file, and since the chunks after it are already
+     * in flight the answer is cut at the first such point rather than at
+     * whichever thread happened to notice.
+     */
+    private int readConcurrently(byte[] out, long offset, int chunk, int[] streams) {
+        ExecutorService pool = pool(streams.length, "read");
+        try {
+            List<Future<Integer>> parts = new ArrayList<>();
+            for (int at = 0, lane = 0; at < out.length; at += chunk, lane++) {
+                int start = at;
+                int want = Math.min(chunk, out.length - at);
+                int pathid = streams[lane % streams.length];
+                parts.add(pool.submit(() -> readInto(out, offset, start, want, pathid)));
+            }
+            int end = out.length;
+            for (int index = 0; index < parts.size(); index++) {
+                int start = index * chunk;
+                int got = settle(parts.get(index));
+                if (got < Math.min(chunk, out.length - start)) {
+                    end = Math.min(end, start + got);
+                }
+            }
+            return end;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** One chunk, retried at the offsets a short read leaves behind. */
+    private int readInto(byte[] out, long offset, int start, int want, int pathid) {
+        int filled = 0;
+        while (filled < want) {
+            byte[] part = read(offset + start + filled, want - filled, pathid);
+            if (part.length == 0) {
+                break;
+            }
+            System.arraycopy(part, 0, out, start + filled, part.length);
+            filled += part.length;
+        }
+        return filled;
     }
 
     /**
@@ -123,15 +224,63 @@ public final class XrdFile implements Closeable {
     }
 
     public void write(long offset, byte[] data) {
+        write(offset, data, 0);
+    }
+
+    /** The same, with the data sent down the bound path {@code pathid}
+     *  instead of the control link. */
+    public void write(long offset, byte[] data, int pathid) {
         check();
-        connection.request(new Requests.Write(fhandle, offset, data));
+        connection.request(new Requests.Write(fhandle, offset, data, pathid));
+    }
+
+    /**
+     * Write a block in {@code chunk}-sized requests spread over every stream
+     * the session has. The mirror of {@link #readAcross}: each stream carries
+     * its own chunks' bytes, so the sockets fill at once instead of in turn.
+     */
+    public void writeAcross(long offset, byte[] data, int chunk) {
+        check();
+        if (chunk <= 0) {
+            throw new IllegalArgumentException("a chunk of " + chunk + " bytes writes nothing");
+        }
+        int[] streams = streams();
+        if (streams.length == 1 || data.length <= chunk) {
+            write(offset, data);
+            return;
+        }
+        ExecutorService pool = pool(streams.length, "write");
+        try {
+            List<Future<Integer>> parts = new ArrayList<>();
+            for (int at = 0, lane = 0; at < data.length; at += chunk, lane++) {
+                int start = at;
+                int want = Math.min(chunk, data.length - at);
+                int pathid = streams[lane % streams.length];
+                parts.add(pool.submit(() -> {
+                    byte[] piece = new byte[want];
+                    System.arraycopy(data, start, piece, 0, want);
+                    write(offset + start, piece, pathid);
+                    return want;
+                }));
+            }
+            for (Future<Integer> part : parts) {
+                settle(part);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     /** Write with per-page CRC32C protection the server verifies. */
     public void pgWrite(long offset, byte[] data) {
+        pgWrite(offset, data, 0);
+    }
+
+    /** The same, down the bound path {@code pathid}. */
+    public void pgWrite(long offset, byte[] data, int pathid) {
         check();
         connection.request(new Requests.PgWrite(fhandle, offset,
-                PagedIo.packPages(offset, data)));
+                PagedIo.packPages(offset, data), 0, pathid));
     }
 
     /** Several writes in one round trip. */
@@ -149,6 +298,16 @@ public final class XrdFile implements Closeable {
     public void sync() {
         check();
         connection.request(new Requests.Sync(fhandle));
+    }
+
+    /**
+     * The same, with its own patience. A sync is ordinarily immediate, but
+     * the one that drives a third-party copy does not answer until the
+     * destination has pulled the whole file.
+     */
+    public void syncWithin(java.time.Duration timeout) {
+        check();
+        connection.request(new Requests.Sync(fhandle), timeout);
     }
 
     public void truncate(long size) {
@@ -210,6 +369,57 @@ public final class XrdFile implements Closeable {
                 connection.request(new Requests.Stat("", 0, fhandle)).data(), path());
     }
 
+    // -----------------------------------------------------------------
+    // Server-side copy
+    // -----------------------------------------------------------------
+
+    /** The server's handle for this file, copied: the array on the wire is
+     *  the connection's and must not be edited under it. */
+    public byte[] handle() {
+        return fhandle.clone();
+    }
+
+    /**
+     * {@code kXR_clone}: have the server copy ranges out of another file it
+     * already has open into this one, so that the bytes never leave it.
+     *
+     * <p>This is <em>not</em> a stock XRootD request — it sits past
+     * {@code kXR_REQFENCE} and comes from the nginx-xrootd server, whose
+     * implementation this encoder matches. A stock server answers
+     * {@code kXR_InvalidRequest}, which is the correct thing for it to do.
+     *
+     * <p>Both files must be open on the same connection: a file handle means
+     * nothing to a server that did not grant it.
+     */
+    public void cloneFrom(XrdFile source, long sourceOffset, long length, long offset) {
+        cloneFrom(source, List.of(new long[] {sourceOffset, length, offset}));
+    }
+
+    /** Several ranges of one file, {@code {sourceOffset, length, offset}} each. */
+    public void cloneFrom(XrdFile source, List<long[]> ranges) {
+        check();
+        if (source.connection != connection) {
+            throw new XrdException(source.path() + " is open on another connection than "
+                    + path() + "; a file handle means nothing to a server that did not"
+                    + " grant it");
+        }
+        List<Requests.CloneItem> items = new ArrayList<>();
+        for (long[] range : ranges) {
+            items.add(new Requests.CloneItem(source.fhandle, range[0], range[1], range[2]));
+        }
+        cloneFrom(items);
+    }
+
+    /** The general form: ranges from any set of files open on this
+     *  connection. Longer lists are split at the server's own item limit. */
+    public void cloneFrom(List<Requests.CloneItem> items) {
+        check();
+        for (int start = 0; start < items.size(); start += XrdConst.CLONE_MAXITEMS) {
+            connection.request(new Requests.Clone(fhandle, items.subList(start,
+                    Math.min(start + XrdConst.CLONE_MAXITEMS, items.size()))));
+        }
+    }
+
     @Override
     public void close() {
         if (closed) {
@@ -222,6 +432,39 @@ public final class XrdFile implements Closeable {
     private void check() {
         if (closed) {
             throw new XrdException(path() + " is closed");
+        }
+    }
+
+    /** One daemon thread per stream, named for whoever has to read a stack. */
+    private ExecutorService pool(int threads, String what) {
+        AtomicInteger next = new AtomicInteger();
+        return Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable,
+                    "jroot-" + what + "-" + url.host() + "-" + next.getAndIncrement());
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    /** A chunk's result, with the exception it failed with put back as it
+     *  was thrown — a server error stays an {@link XrdException} even though
+     *  it came out of another thread. */
+    private int settle(Future<Integer> part) {
+        try {
+            return part.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new XrdException("interrupted transferring " + path(), e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof XrdException xrd) {
+                throw xrd;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new XrdException("transferring " + path() + " failed: "
+                    + cause.getMessage(), cause);
         }
     }
 

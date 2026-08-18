@@ -232,6 +232,20 @@ public final class XrdConst {
     // ---- kXR_writev options ----
     public static final int kXR_wv_doSync = 0x01;
 
+    // ---- kXR_gpfile options ----
+    public static final int kXR_gpfGet = 0x00;
+    public static final int kXR_gpfPut = 0x01;
+
+    // ---- kXR_clone, an nginx-xrootd extension past kXR_REQFENCE ----
+    /** src_fhandle[4] reserved[4] src_offset[8] src_len[8] dst_offset[8]. */
+    public static final int CLONE_ITEM_LEN = 32;
+    /** The server's own {@code maxClonesz}. */
+    public static final int CLONE_MAXITEMS = 1024;
+
+    // ---- multi-stream data paths (kXR_bind) ----
+    /** Path ids are one byte, and 0 names the control link. */
+    public static final int MAX_DATA_PATHS = 15;
+
     // ---- kXR_fattr subcodes + options ----
     public static final int kXR_fattrDel  = 0x00;
     public static final int kXR_fattrGet  = 0x01;

@@ -33,11 +33,14 @@ public final class Config {
     private final Duration requestTimeout;
     private final int maxRedirects;
     private final int maxWaitSeconds;
+    private final int dataStreams;
+    private final boolean delegateProxy;
 
     private Config(String username, String token, Path proxyPath, Path caPath,
                    boolean allowUnix, boolean verifyPeer, Tls tls, List<String> mechanisms,
                    Duration connectTimeout, Duration requestTimeout,
-                   int maxRedirects, int maxWaitSeconds) {
+                   int maxRedirects, int maxWaitSeconds, int dataStreams,
+                   boolean delegateProxy) {
         this.username = username;
         this.token = token;
         this.proxyPath = proxyPath;
@@ -50,13 +53,15 @@ public final class Config {
         this.requestTimeout = requestTimeout;
         this.maxRedirects = maxRedirects;
         this.maxWaitSeconds = maxWaitSeconds;
+        this.dataStreams = dataStreams;
+        this.delegateProxy = delegateProxy;
     }
 
     /** The defaults: whatever the environment already says, and nothing else. */
     public static Config defaults() {
         return new Config(System.getProperty("user.name", "nobody"), null, null, null,
                 true, true, Tls.AUTO, List.of(),
-                Duration.ofSeconds(30), Duration.ofMinutes(5), 16, 300);
+                Duration.ofSeconds(30), Duration.ofMinutes(5), 16, 300, 1, false);
     }
 
     public String username() {
@@ -113,64 +118,102 @@ public final class Config {
         return maxWaitSeconds;
     }
 
+    /**
+     * How many TCP streams one session may carry data on, the control link
+     * included. One — the default — is a single socket and no
+     * {@code kXR_bind}; more binds that many less one extra sockets to the
+     * session when a file is opened, which is what fills a long fat network
+     * that a single stream leaves half idle.
+     */
+    public int dataStreams() {
+        return dataStreams;
+    }
+
     public Config withUsername(String value) {
         return new Config(value, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withToken(String value) {
         return new Config(username, value, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withProxyPath(Path value) {
         return new Config(username, token, value, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withCaPath(Path value) {
         return new Config(username, token, proxyPath, value, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withAllowUnix(boolean value) {
         return new Config(username, token, proxyPath, caPath, value, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withVerifyPeer(boolean value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, value, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withTls(Tls value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, value,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withMechanisms(List<String> value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                value, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds);
+                value, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withConnectTimeout(Duration value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, value, requestTimeout, maxRedirects, maxWaitSeconds);
+                mechanisms, value, requestTimeout, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withRequestTimeout(Duration value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, value, maxRedirects, maxWaitSeconds);
+                mechanisms, connectTimeout, value, maxRedirects, maxWaitSeconds, dataStreams, delegateProxy);
     }
 
     public Config withMaxRedirects(int value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, value, maxWaitSeconds);
+                mechanisms, connectTimeout, requestTimeout, value, maxWaitSeconds,
+                dataStreams, delegateProxy);
     }
 
     public Config withMaxWaitSeconds(int value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
-                mechanisms, connectTimeout, requestTimeout, maxRedirects, value);
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, value,
+                dataStreams, delegateProxy);
+    }
+
+    /** Clamped to 1..{@value io.github.robc.jroot.wire.XrdConst#MAX_DATA_PATHS}+1:
+     *  a path id is one byte and zero is the control link. */
+    public Config withDataStreams(int value) {
+        return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
+                Math.max(1, Math.min(value, io.github.robc.jroot.wire.XrdConst.MAX_DATA_PATHS + 1)),
+                delegateProxy);
+    }
+
+    /**
+     * Whether this client will sign a proxy for a server that asks for one.
+     * Off by default: delegation hands the far end a credential that carries
+     * your identity until your own proxy expires, which is a thing to decide
+     * rather than a thing to discover.
+     */
+    public boolean delegateProxy() {
+        return delegateProxy;
+    }
+
+    public Config withDelegateProxy(boolean value) {
+        return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
+                dataStreams, value);
     }
 
     @Override

@@ -2,6 +2,8 @@ package io.github.robc.jroot.client;
 
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -36,6 +38,14 @@ import io.github.robc.jroot.wire.XrdConst;
  * cache is the point.
  */
 public final class XrdClient implements Closeable {
+
+    /** The unit a whole-file transfer is cut into: one round trip's worth of
+     *  data on a wide-area link, and the granularity a multi-stream transfer
+     *  hands to each stream. */
+    public static final int TRANSFER_CHUNK = 8 << 20;
+
+    /** The floor on how long a third-party copy may take. */
+    private static final Duration TPC_TIMEOUT = Duration.ofHours(1);
 
     private final Config config;
     private final Map<String, XrdConnection> connections = new ConcurrentHashMap<>();
@@ -327,26 +337,160 @@ public final class XrdClient implements Closeable {
             OpenInfo info = Responses.parseOpen(
                     connection.request(new Requests.Open(at.pathWithCgi(), options, mode)).data(),
                     at.path());
+            // After the open, not before: a redirect would have thrown, and
+            // the server that granted the handle is the one worth binding
+            // extra streams to.
+            connection.ensureDataPaths();
             return new XrdFile(connection, at, info);
         });
     }
 
-    /** Read a whole file. */
+    /** Read a whole file, over every stream the session has. */
     public byte[] read(String url) {
         try (XrdFile file = open(url)) {
-            return file.readAll(8 << 20);
+            return file.readAll(TRANSFER_CHUNK);
         }
     }
 
     /** Write a whole file, replacing anything already there. */
     public void write(String url, byte[] data, int mode) {
         try (XrdFile file = create(url, mode)) {
-            file.write(0, data);
+            file.writeAcross(0, data, TRANSFER_CHUNK);
         }
     }
 
     public void write(String url, byte[] data) {
         write(url, data, 0644);
+    }
+
+    // -----------------------------------------------------------------
+    // Third-party copy
+    // -----------------------------------------------------------------
+
+    /**
+     * Have the destination server pull a file straight from the source, so
+     * that the bytes never pass through this process.
+     *
+     * <p>There is no {@code kXR_tpc} request: a third-party copy is arranged
+     * entirely through opaque tags on two {@code kXR_open}s that share a
+     * rendezvous key.
+     *
+     * <ol>
+     *   <li>A placement open of the source, closed immediately, which is what
+     *       resolves the manager to the data server that actually holds the
+     *       file — everything after this names that server.</li>
+     *   <li>The source open that registers the key and names the destination.
+     *       Its handle stays open for the whole transfer: closing it would
+     *       unregister the key before the destination arrived to use it.</li>
+     *   <li>The destination open, carrying the source, the key and the size,
+     *       with {@code kXR_delete|kXR_open_updt} — a plain create is treated
+     *       as an ordinary write rather than a pull.</li>
+     *   <li>Two {@code kXR_sync} on the destination handle: the first starts
+     *       the copy, the second does not answer until it has finished, which
+     *       is why it is given {@link #tpcTimeout()} rather than the ordinary
+     *       request timeout.</li>
+     * </ol>
+     *
+     * <p>The source is opened for reading with this client's credentials;
+     * whether the destination may then read it is the source server's
+     * decision, made from the delegation the two servers agree on. This
+     * client asks for none ({@code tpc.dlgon=0}), so both ends must already
+     * trust each other, which is how a site with a TPC-enabled pair is set up.
+     */
+    public void thirdPartyCopy(String sourceUrl, String targetUrl) {
+        thirdPartyCopy(XrdUrl.parse(sourceUrl), XrdUrl.parse(targetUrl));
+    }
+
+    public void thirdPartyCopy(XrdUrl source, XrdUrl target) {
+        long size = stat(source).size();
+        String key = rendezvousKey();
+
+        XrdUrl at = placementOf(source);
+        String srcEndpoint = at.host() + ":" + at.port();
+        String srcOpaque = "tpc.dst=" + target.host() + "&tpc.key=" + key + "&tpc.stage=copy";
+
+        try (XrdFile coordinator = open(at.withCgi(append(at.cgi(), srcOpaque)),
+                XrdConst.kXR_open_read | XrdConst.kXR_retstat | XrdConst.kXR_async, 0)) {
+            String dstOpaque = "oss.asize=" + size
+                    + "&tpc.dlg=" + srcEndpoint
+                    + "&tpc.dlgon=0"
+                    + "&tpc.key=" + key
+                    + "&tpc.lfn=" + at.path()
+                    + "&tpc.spr=root"
+                    + "&tpc.src=" + srcEndpoint
+                    + "&tpc.stage=copy"
+                    + "&tpc.tpr=root";
+            try (XrdFile puller = open(target.withCgi(append(target.cgi(), dstOpaque)),
+                    XrdConst.kXR_delete | XrdConst.kXR_open_updt
+                            | XrdConst.kXR_retstat | XrdConst.kXR_async,
+                    XrdConst.DEFAULT_FILE_MODE)) {
+                puller.sync();                      // start the copy
+                puller.syncWithin(tpcTimeout());    // and wait it out
+            }
+        }
+    }
+
+    /**
+     * How long the destination is given to finish. A transfer is not a
+     * request — the file may be a terabyte — so the configured request
+     * timeout is only a floor.
+     */
+    public Duration tpcTimeout() {
+        Duration configured = config.requestTimeout();
+        return configured.compareTo(TPC_TIMEOUT) > 0 ? configured : TPC_TIMEOUT;
+    }
+
+    /** The data server holding {@code source}, found the way the stock client
+     *  finds it: an open that asks for nothing but the placement. */
+    private XrdUrl placementOf(XrdUrl source) {
+        try (XrdFile probe = open(source.withCgi(append(source.cgi(), "tpc.stage=placement")),
+                XrdConst.kXR_open_read | XrdConst.kXR_retstat | XrdConst.kXR_async, 0)) {
+            // Where the probe landed, with the caller's own opaque back in
+            // place: the probe's stage tag has done its work and must not
+            // travel on to the open that arranges the copy.
+            return probe.url().withCgi(source.cgi());
+        } catch (XrdException e) {
+            // A server that will not take the probe may still take the copy;
+            // the URL as given is then the best guess at where the file is.
+            return source;
+        }
+    }
+
+    /** 12 random bytes as 24 hexadecimal characters, which is the shape of
+     *  key every XRootD TPC implementation expects. */
+    private static String rendezvousKey() {
+        byte[] raw = new byte[12];
+        new SecureRandom().nextBytes(raw);
+        StringBuilder key = new StringBuilder(raw.length * 2);
+        for (byte b : raw) {
+            key.append(Character.forDigit((b >> 4) & 0xF, 16))
+                    .append(Character.forDigit(b & 0xF, 16));
+        }
+        return key.toString();
+    }
+
+    private static String append(String cgi, String more) {
+        return cgi.isEmpty() ? more : cgi + "&" + more;
+    }
+
+    /**
+     * {@code kXR_gpfile}: ask the server to fetch or deposit a file itself,
+     * naming the transfer in the opaque information the path carries.
+     *
+     * <p>Present for completeness rather than for use. The request is defined
+     * in {@code XProtocol.hh} and upstream marks it unfinished; no released
+     * server implements it, and one that recognises the opcode at all answers
+     * {@code kXR_Unsupported}. A third-party copy is what actually moves a
+     * file between servers — see {@link #thirdPartyCopy}.
+     *
+     * @param options {@link XrdConst#kXR_gpfGet} or {@link XrdConst#kXR_gpfPut}
+     * @param bufferSize the transfer buffer to use, or 0 for the server's own
+     */
+    public String getPutFile(String url, int options, int bufferSize) {
+        XrdUrl parsed = XrdUrl.parse(url);
+        return execute(parsed, (connection, at) -> new String(
+                connection.request(new Requests.GpFile(at.pathWithCgi(), options, bufferSize))
+                        .data(), StandardCharsets.UTF_8).trim());
     }
 
     /** A round trip to prove the connection is alive. */

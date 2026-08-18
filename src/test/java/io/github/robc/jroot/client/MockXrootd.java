@@ -12,7 +12,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.robc.jroot.wire.WBuf;
 import io.github.robc.jroot.wire.XrdConst;
@@ -26,6 +28,13 @@ import io.github.robc.jroot.wire.XrdConst;
  * <p>Behaviour is set per opcode with {@link #on}, which lets one test make
  * the server answer {@code kXR_wait} and another make it redirect, without
  * either knowing how the frames are built.
+ *
+ * <p>It also binds data paths. A {@code kXR_bind} turns the socket it arrived
+ * on into one, after which that socket carries no requests at all: the bulk
+ * bytes of a {@code kXR_write} that names it, and the answers to a
+ * {@code kXR_read} that does. Splitting the frame is the whole point of the
+ * feature, so the server has to put it back together the way a real one does
+ * — from {@code dlen} on the control link and the bytes on the path.
  */
 final class MockXrootd implements AutoCloseable {
 
@@ -63,6 +72,11 @@ final class MockXrootd implements AutoCloseable {
                 value = (value << 8) | (params[i] & 0xFF);
             }
             return value;
+        }
+
+        /** The data path this request named, or 0 for the control link. */
+        int pathId() {
+            return MockXrootd.pathId(opcode, params, payload);
         }
     }
 
@@ -102,6 +116,8 @@ final class MockXrootd implements AutoCloseable {
     private final Map<Integer, Handler> handlers = new HashMap<>();
     private final List<Request> seen = new CopyOnWriteArrayList<>();
     private final List<Socket> clients = new CopyOnWriteArrayList<>();
+    private final Map<Integer, DataPath> paths = new ConcurrentHashMap<>();
+    private final AtomicInteger nextPathId = new AtomicInteger(1);
     private volatile int protocolFlags;
     private volatile String securityOffer = "";
     private volatile boolean running = true;
@@ -132,6 +148,11 @@ final class MockXrootd implements AutoCloseable {
         return this;
     }
 
+    /** The extra streams bound to this server, lowest id first. */
+    List<Integer> boundPaths() {
+        return paths.keySet().stream().sorted().toList();
+    }
+
     List<Request> requests() {
         return List.copyOf(seen);
     }
@@ -157,19 +178,35 @@ final class MockXrootd implements AutoCloseable {
     }
 
     private void serve(Socket socket) {
-        try (socket) {
+        try {
             socket.setTcpNoDelay(true);
             DataInputStream in = new DataInputStream(socket.getInputStream());
             OutputStream out = socket.getOutputStream();
             handshake(in, out);
-            while (running) {
-                if (!request(in, out)) {
-                    return;
-                }
+            while (running && request(socket, in, out)) {
+                // until the client hangs up, or this socket becomes a data path
             }
         } catch (IOException e) {
             // a client that went away mid-session is how close() looks from here
+        } catch (RuntimeException e) {
+            // A handler that threw would otherwise show up at the client as a
+            // closed socket, which says nothing about what actually happened.
+            e.printStackTrace();
+        } finally {
+            // A bound path outlives the thread that bound it: from here on the
+            // session's control thread is the one that reads and writes it.
+            if (!isBound(socket)) {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    // already gone
+                }
+            }
         }
+    }
+
+    private boolean isBound(Socket socket) {
+        return paths.values().stream().anyMatch(path -> path.socket() == socket);
     }
 
     private void handshake(DataInputStream in, OutputStream out) throws IOException {
@@ -179,7 +216,8 @@ final class MockXrootd implements AutoCloseable {
                 .i32(XrdConst.kXR_PROTOCOLVERSION).i32(XrdConst.kXR_DataServer).bytes());
     }
 
-    private boolean request(DataInputStream in, OutputStream out) throws IOException {
+    private boolean request(Socket socket, DataInputStream in, OutputStream out)
+            throws IOException {
         byte[] header = new byte[XrdConst.REQUEST_HDRLEN];
         try {
             in.readFully(header);
@@ -192,21 +230,86 @@ final class MockXrootd implements AutoCloseable {
         System.arraycopy(header, 4, params, 0, 16);
         int dlen = ((header[20] & 0xFF) << 24) | ((header[21] & 0xFF) << 16)
                 | ((header[22] & 0xFF) << 8) | (header[23] & 0xFF);
+        // dlen counts the bytes on both links; only the ones a data path
+        // carries are missing from this socket.
+        int onPath = pathDataLength(opcode, params, dlen);
         byte[] payload = new byte[dlen];
-        in.readFully(payload);
+        in.readFully(payload, 0, dlen - onPath);
+        if (onPath > 0) {
+            pathOrFail(params[12] & 0xFF, opcode).in().readFully(payload, dlen - onPath, onPath);
+        }
         Request request = new Request(streamId, opcode, params, payload);
         seen.add(request);
 
+        if (opcode == XrdConst.kXR_bind && !handlers.containsKey(XrdConst.kXR_bind)) {
+            bind(socket, in, out, streamId);
+            return false;               // from here on this socket is a data path
+        }
         Handler handler = handlers.get(opcode);
         List<Reply> replies = handler != null ? handler.handle(request) : builtin(request);
         if (replies == null || replies.isEmpty()) {
             replies = List.of(Reply.ok(new byte[0]));
         }
+        OutputStream link = replyLink(request, out);
         for (Reply reply : replies) {
-            send(out, streamId, reply.status(), reply.data());
+            send(link, streamId, reply.status(), reply.data());
         }
         return true;
     }
+
+    /**
+     * Turn this socket into a data path and name it. Registered before the
+     * answer goes out, because the client may put a request down the path as
+     * soon as it reads the id.
+     */
+    private void bind(Socket socket, DataInputStream in, OutputStream out, int streamId)
+            throws IOException {
+        int pathid = nextPathId.getAndIncrement();
+        paths.put(pathid, new DataPath(socket, in, out));
+        send(out, streamId, XrdConst.kXR_ok, new byte[] {(byte) pathid});
+    }
+
+    /** Which link a request's answer goes down: a read that named a path is
+     *  answered on it, and everything else on the link it arrived on. */
+    private OutputStream replyLink(Request request, OutputStream control) {
+        int pathid = request.pathId();
+        if (pathid == 0 || request.opcode() == XrdConst.kXR_write
+                || request.opcode() == XrdConst.kXR_pgwrite) {
+            return control;
+        }
+        return pathOrFail(pathid, request.opcode()).out();
+    }
+
+    /** How many of a request's {@code dlen} bytes travel down a data path
+     *  rather than the control link. */
+    private static int pathDataLength(int opcode, byte[] params, int dlen) {
+        return (opcode == XrdConst.kXR_write || opcode == XrdConst.kXR_pgwrite)
+                && (params[12] & 0xFF) != 0 ? dlen : 0;
+    }
+
+    /** The path id a request names. Where the byte sits is per-opcode: the
+     *  parameters for a write, an optional payload for a read. */
+    private static int pathId(int opcode, byte[] params, byte[] payload) {
+        return switch (opcode) {
+            case XrdConst.kXR_write, XrdConst.kXR_pgwrite -> params[12] & 0xFF;
+            case XrdConst.kXR_readv -> params[15] & 0xFF;
+            case XrdConst.kXR_read -> payload.length >= 1 ? payload[0] & 0xFF : 0;
+            default -> 0;
+        };
+    }
+
+    private DataPath pathOrFail(int pathid, int opcode) {
+        DataPath path = paths.get(pathid);
+        if (path == null) {
+            throw new IllegalStateException("opcode " + opcode + " named data path "
+                    + pathid + ", which is not bound");
+        }
+        return path;
+    }
+
+    /** One bound socket, and the streams the session's control thread uses to
+     *  work it. */
+    private record DataPath(Socket socket, DataInputStream in, OutputStream out) {}
 
     /** The bring-up requests every session makes, answered the same way each time. */
     private List<Reply> builtin(Request request) {
@@ -222,8 +325,10 @@ final class MockXrootd implements AutoCloseable {
 
     private void send(OutputStream out, int streamId, int status, byte[] data)
             throws IOException {
-        out.write(new WBuf().u16(streamId).u16(status).i32(data.length).raw(data).bytes());
-        out.flush();
+        synchronized (out) {
+            out.write(new WBuf().u16(streamId).u16(status).i32(data.length).raw(data).bytes());
+            out.flush();
+        }
     }
 
     /** Send an unsolicited response on {@code streamId}, as a server does when

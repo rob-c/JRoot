@@ -289,17 +289,25 @@ public final class JRoot implements Closeable {
 
     /**
      * Ask the two servers to move the data between themselves, without it
-     * passing through this process. Both ends must be HTTP: the binary
-     * protocol's third-party copy is arranged through opaque tags on
-     * {@code kXR_open} rather than a request of its own, and is a different
-     * enough dance to deserve being asked for explicitly.
+     * passing through this process.
+     *
+     * <p>Both ends must speak the same protocol, because the two arrangements
+     * share nothing: HTTP uses a {@code COPY} with a delegated bearer token,
+     * the binary protocol a rendezvous key carried on two {@code kXR_open}s.
+     * A copy between the two is an ordinary {@link #copy}, which is what a
+     * caller who does not mind the bytes passing through should ask for.
      */
     public void thirdPartyCopy(String source, String target) {
-        if (transportOf(source) != Transport.HTTP || transportOf(target) != Transport.HTTP) {
-            throw new XrdException("a third-party copy needs an HTTP URL at both ends: "
-                    + source + " to " + target);
+        Transport transport = transportOf(source);
+        if (transport != transportOf(target) || transport == Transport.LOCAL) {
+            throw new XrdException("a third-party copy needs two servers of the same"
+                    + " protocol: " + source + " to " + target);
         }
-        webdav().thirdPartyCopy(source, target);
+        switch (transport) {
+            case XROOTD -> xrootd().thirdPartyCopy(source, target);
+            case HTTP -> webdav().thirdPartyCopy(source, target);
+            case LOCAL -> throw new IllegalStateException();
+        }
     }
 
     /**
@@ -472,19 +480,31 @@ public final class JRoot implements Closeable {
         void close();
     }
 
+    /**
+     * How much of a copy chunk one stream carries. With a single stream that
+     * is the whole chunk — splitting it would only add round trips — and with
+     * several it is a share large enough to still amortise one, so that a
+     * chunk keeps every stream busy at the same time.
+     */
+    private static int streamChunk(XrdFile file) {
+        int streams = file.streams().length;
+        return streams <= 1 ? COPY_CHUNK : Math.max(COPY_CHUNK / streams, 1 << 20);
+    }
+
     private Source source(String url) {
         return switch (transportOf(url)) {
             case XROOTD -> {
                 XrdFile file = xrootd().open(url);
                 yield new Source() {
                     private final long size = file.size();
+                    private final int chunk = streamChunk(file);
 
                     @Override public long size() {
                         return size;
                     }
 
                     @Override public byte[] read(long offset, int length) {
-                        return file.read(offset, length);
+                        return file.readAcross(offset, length, chunk);
                     }
 
                     @Override public void close() {
@@ -516,8 +536,10 @@ public final class JRoot implements Closeable {
             case XROOTD -> {
                 XrdFile file = xrootd().create(url, XrdConst.DEFAULT_FILE_MODE);
                 yield new Sink() {
+                    private final int chunk = streamChunk(file);
+
                     @Override public void write(long offset, byte[] data) {
-                        file.write(offset, data);
+                        file.writeAcross(offset, data, chunk);
                     }
 
                     @Override public void close() {
