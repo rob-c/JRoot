@@ -1,6 +1,7 @@
 package io.github.robc.jroot;
 
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -35,6 +36,7 @@ public final class Cli {
     private final PrintStream err;
     private boolean longListing;
     private boolean makePath;
+    private boolean recursive;
     private boolean debug;
 
     Cli(PrintStream out, PrintStream err) {
@@ -78,6 +80,7 @@ public final class Cli {
                     }
                     case "-l", "--long" -> longListing = true;
                     case "-p", "--parents" -> makePath = true;
+                    case "-r", "-R", "--recursive" -> recursive = true;
                     case "-d", "--debug" -> debug = true;
                     case "--token" -> config = config.withToken(value != null ? value : args[++i]);
                     case "--proxy" -> config = config.withProxyPath(
@@ -90,6 +93,8 @@ public final class Cli {
                             tlsMode(value != null ? value : args[++i]));
                     case "--no-verify" -> config = config.withVerifyPeer(false);
                     case "--delegate" -> config = config.withDelegateProxy(true);
+                    case "--keytab" -> config = config.withKeytab(
+                            Path.of(value != null ? value : args[++i]));
                     case "--streams" -> config = config.withDataStreams(
                             Integer.parseInt(value != null ? value : args[++i]));
                     case "--timeout" -> config = config.withRequestTimeout(
@@ -172,7 +177,11 @@ public final class Cli {
             }
             case "cp" -> {
                 require(args, 2, "cp SOURCE DEST");
-                jroot.copy(args.get(0), args.get(1));
+                if (recursive) {
+                    jroot.copyTree(args.get(0), args.get(1));
+                } else {
+                    jroot.copy(args.get(0), args.get(1));
+                }
                 out.println(args.get(1) + ": written");
             }
             case "tpc" -> {
@@ -182,7 +191,7 @@ public final class Cli {
             }
             case "rm" -> {
                 require(args, 1, "rm URL");
-                args.forEach(jroot::rm);
+                args.forEach(recursive ? jroot::rmTree : jroot::rm);
             }
             case "mkdir" -> {
                 require(args, 1, "mkdir URL");
@@ -197,6 +206,18 @@ public final class Cli {
             case "mv" -> {
                 require(args, 2, "mv SOURCE DEST");
                 jroot.mv(args.get(0), args.get(1));
+            }
+            case "chmod" -> {
+                require(args, 2, "chmod MODE URL");
+                jroot.chmod(args.get(1), Integer.parseInt(args.get(0), 8));
+            }
+            case "truncate" -> {
+                require(args, 2, "truncate SIZE URL");
+                jroot.truncate(args.get(1), Long.parseLong(args.get(0)));
+            }
+            case "xattr" -> {
+                require(args, 1, "xattr URL [NAME [VALUE]]");
+                return attributes(jroot, args);
             }
             case "checksum" -> {
                 require(args, 1, "checksum URL [ALGORITHM]");
@@ -241,6 +262,36 @@ public final class Cli {
                 usage(err);
                 return 2;
             }
+        }
+        return 0;
+    }
+
+    /**
+     * {@code xattr URL} lists, {@code xattr URL NAME} reads one, {@code xattr
+     * URL NAME VALUE} sets it, and an empty value removes it — the shape
+     * {@code getfattr} and {@code setfattr} between them have.
+     */
+    private int attributes(JRoot jroot, List<String> args) {
+        String url = args.get(0);
+        if (args.size() == 1) {
+            jroot.attributes(url).forEach((name, value) ->
+                    out.println(name + "\t" + new String(value, StandardCharsets.UTF_8)));
+            return 0;
+        }
+        String name = args.get(1);
+        if (args.size() == 2) {
+            byte[] value = jroot.attribute(url, name).orElse(null);
+            if (value == null) {
+                err.println("jroot: " + url + " has no attribute " + name);
+                return 1;
+            }
+            out.println(new String(value, StandardCharsets.UTF_8));
+            return 0;
+        }
+        if (args.get(2).isEmpty()) {
+            jroot.deleteAttribute(url, name);
+        } else {
+            jroot.setAttribute(url, name, args.get(2).getBytes(StandardCharsets.UTF_8));
         }
         return 0;
     }
@@ -344,10 +395,13 @@ public final class Cli {
                   put FILE URL           upload a file
                   cp SOURCE DEST         copy between any two URLs
                   tpc SOURCE DEST        server-to-server copy
-                  rm URL...              remove files
+                  rm URL...              remove files (-r for whole trees)
                   mkdir URL...           create directories
                   rmdir URL...           remove directories
                   mv SOURCE DEST         rename within one server
+                  chmod MODE URL         change the permission bits
+                  truncate SIZE URL      cut or extend a file
+                  xattr URL [NAME [VAL]] list, read, set or remove an attribute
                   checksum URL [ALG]     the checksum the server holds
                   ping URL               round-trip time to a server
                   locate URL             which servers hold a file  (root:// only)
@@ -365,6 +419,7 @@ public final class Cli {
                 options:
                   -l, --long             a long listing
                   -p, --parents          create missing parent directories
+                  -r, -R, --recursive    for cp and rm, work on whole trees
                   --token VALUE          a bearer token (else the WLCG discovery order)
                   --proxy PATH           an X.509 proxy (else $X509_USER_PROXY)
                   --ca PATH              the CA directory (else $X509_CERT_DIR)
@@ -372,6 +427,7 @@ public final class Cli {
                   --tls auto|require|off when to turn on TLS
                   --no-verify            do not verify the server certificate
                   --delegate             sign a proxy for a server that asks
+                  --keytab PATH          an sss keytab (else $XrdSecSSSKT)
                   --timeout SECONDS      how long one request may take
                   --streams N            TCP streams per root:// session (default 1)
                   -d, --debug            print stack traces

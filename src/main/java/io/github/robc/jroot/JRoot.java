@@ -3,15 +3,22 @@ package io.github.robc.jroot;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.UserDefinedFileAttributeView;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import io.github.robc.jroot.client.XrdClient;
 import io.github.robc.jroot.client.XrdFile;
@@ -20,6 +27,7 @@ import io.github.robc.jroot.http.HttpStorage;
 import io.github.robc.jroot.http.WebDav;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
+import io.github.robc.jroot.wire.Types.FattrItem;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
@@ -387,6 +395,31 @@ public final class JRoot implements Closeable {
         }
     }
 
+    /**
+     * Copy a whole tree. A file is copied as {@link #copy(String, String)}
+     * would; a directory is created at the far end and its children copied
+     * into it, so the destination ends up with the source's contents rather
+     * than with the source inside it — the {@code cp -r src/. dst} sense,
+     * which is the only one that composes when the recursion goes a level
+     * deeper.
+     */
+    public void copyTree(String source, String target) {
+        if (!stat(source).isDirectory()) {
+            copy(source, target);
+            return;
+        }
+        mkdir(target, true);
+        for (DirEntry entry : list(source)) {
+            String from = child(source, entry.name());
+            String to = child(target, entry.name());
+            if (entry.isDirectory()) {
+                copyTree(from, to);
+            } else {
+                copy(from, to);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Namespace
     // -----------------------------------------------------------------
@@ -456,6 +489,191 @@ public final class JRoot implements Closeable {
                 }
             }
         }
+    }
+
+    /**
+     * Remove a directory and everything under it.
+     *
+     * <p>Only WebDAV has this as one request — {@code DELETE} of a collection
+     * is recursive by definition — so elsewhere the tree is walked and
+     * removed depth first, which is also the only order a server will accept:
+     * a directory cannot go until it is empty.
+     */
+    public void rmTree(String url) {
+        if (!statIfPresent(url).map(StatInfo::isDirectory).orElse(false)) {
+            rm(url);
+            return;
+        }
+        switch (transportOf(url)) {
+            case HTTP -> webdav().rmdir(url);
+            case LOCAL -> localDelete(localPath(url), true);
+            case XROOTD -> {
+                for (DirEntry entry : list(url)) {
+                    rmTree(child(url, entry.name()));
+                }
+                rmdir(url);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Attributes
+    // -----------------------------------------------------------------
+
+    /**
+     * Change the permission bits. A namespace operation, so it exists only
+     * where there is a namespace to change: HTTP has no notion of one, and
+     * says so rather than pretending the call succeeded.
+     */
+    public void chmod(String url, int mode) {
+        switch (transportOf(url)) {
+            case XROOTD -> xrootd().chmod(url, mode);
+            case LOCAL -> {
+                Path path = localPath(url);
+                try {
+                    Files.setPosixFilePermissions(path, modeToPermissions(mode));
+                } catch (IOException e) {
+                    throw localFailure("chmod", path, e);
+                } catch (UnsupportedOperationException e) {
+                    throw new XrdException(path + ": this filesystem has no POSIX modes");
+                }
+            }
+            case HTTP -> throw new XrdException(
+                    "HTTP has no permission bits: " + url);
+        }
+    }
+
+    /** Cut a file to {@code size}, extending it with zeroes if it was shorter. */
+    public void truncate(String url, long size) {
+        switch (transportOf(url)) {
+            case XROOTD -> xrootd().truncate(url, size);
+            case LOCAL -> {
+                Path path = localPath(url);
+                try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+                    if (size <= channel.size()) {
+                        channel.truncate(size);
+                    } else {
+                        channel.write(java.nio.ByteBuffer.allocate(1), size - 1);
+                    }
+                } catch (IOException e) {
+                    throw localFailure("truncate", path, e);
+                }
+            }
+            case HTTP -> throw new XrdException(
+                    "HTTP can replace an object but not truncate one: " + url);
+        }
+    }
+
+    /** Every extended attribute and its value, by name. */
+    public Map<String, byte[]> attributes(String url) {
+        Map<String, byte[]> out = new LinkedHashMap<>();
+        switch (transportOf(url)) {
+            case XROOTD -> {
+                for (FattrItem item : xrootd().listAttributes(url, true).items()) {
+                    out.put(item.name(), item.value());
+                }
+            }
+            case LOCAL -> {
+                UserDefinedFileAttributeView view = localAttributes(localPath(url));
+                try {
+                    for (String name : view.list()) {
+                        java.nio.ByteBuffer buffer =
+                                java.nio.ByteBuffer.allocate(view.size(name));
+                        view.read(name, buffer);
+                        out.put(name, buffer.array());
+                    }
+                } catch (IOException e) {
+                    throw localFailure("read the attributes of", localPath(url), e);
+                }
+            }
+            case HTTP -> throw unsupportedAttributes(url);
+        }
+        return out;
+    }
+
+    /** One extended attribute, or empty when the file carries no such name. */
+    public Optional<byte[]> attribute(String url, String name) {
+        return switch (transportOf(url)) {
+            case XROOTD -> xrootd().getAttribute(url, name).items().stream()
+                    .filter(item -> item.code() == 0 && item.value() != null)
+                    .map(FattrItem::value)
+                    .findFirst();
+            case LOCAL -> Optional.ofNullable(attributes(url).get(name));
+            case HTTP -> throw unsupportedAttributes(url);
+        };
+    }
+
+    public void setAttribute(String url, String name, byte[] value) {
+        switch (transportOf(url)) {
+            case XROOTD -> xrootd().setAttribute(url, name, value);
+            case LOCAL -> {
+                try {
+                    localAttributes(localPath(url))
+                            .write(name, java.nio.ByteBuffer.wrap(value));
+                } catch (IOException e) {
+                    throw localFailure("set an attribute on", localPath(url), e);
+                }
+            }
+            case HTTP -> throw unsupportedAttributes(url);
+        }
+    }
+
+    public void deleteAttribute(String url, String name) {
+        switch (transportOf(url)) {
+            case XROOTD -> xrootd().deleteAttribute(url, name);
+            case LOCAL -> {
+                try {
+                    localAttributes(localPath(url)).delete(name);
+                } catch (IOException e) {
+                    throw localFailure("remove an attribute from", localPath(url), e);
+                }
+            }
+            case HTTP -> throw unsupportedAttributes(url);
+        }
+    }
+
+    private static XrdException unsupportedAttributes(String url) {
+        return new XrdException("no transport carries extended attributes over HTTP: " + url);
+    }
+
+    private static UserDefinedFileAttributeView localAttributes(Path path) {
+        UserDefinedFileAttributeView view =
+                Files.getFileAttributeView(path, UserDefinedFileAttributeView.class);
+        if (view == null) {
+            throw new XrdException(path + ": this filesystem has no extended attributes");
+        }
+        if (!Files.exists(path)) {
+            throw new XrdServerException(XrdConst.kXR_NotFound, path + " does not exist");
+        }
+        return view;
+    }
+
+    private static Set<PosixFilePermission> modeToPermissions(int mode) {
+        Set<PosixFilePermission> permissions = EnumSet.noneOf(PosixFilePermission.class);
+        PosixFilePermission[] bits = {
+            PosixFilePermission.OTHERS_EXECUTE, PosixFilePermission.OTHERS_WRITE,
+            PosixFilePermission.OTHERS_READ, PosixFilePermission.GROUP_EXECUTE,
+            PosixFilePermission.GROUP_WRITE, PosixFilePermission.GROUP_READ,
+            PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_READ,
+        };
+        for (int i = 0; i < bits.length; i++) {
+            if ((mode & (1 << i)) != 0) {
+                permissions.add(bits[i]);
+            }
+        }
+        return permissions;
+    }
+
+    /**
+     * A child of {@code url}, with whatever opaque data the parent carried
+     * kept where it belongs — after the path, not inside it.
+     */
+    static String child(String url, String name) {
+        int query = url.indexOf('?');
+        String path = query < 0 ? url : url.substring(0, query);
+        String cgi = query < 0 ? "" : url.substring(query);
+        return (path.endsWith("/") ? path + name : path + "/" + name) + cgi;
     }
 
     // -----------------------------------------------------------------

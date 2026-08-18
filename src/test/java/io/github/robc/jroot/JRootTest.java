@@ -11,6 +11,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserDefinedFileAttributeView;
 import java.util.List;
 
 import org.junit.jupiter.api.AfterEach;
@@ -247,6 +249,98 @@ class JRootTest {
         Files.write(from, large);
         jroot.copy(from.toString(), to.toString());
         assertArrayEquals(large, Files.readAllBytes(to));
+    }
+
+    @Test
+    void changesTheModeOfALocalFile() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        jroot.chmod(file.toString(), 0640);
+        assertEquals(PosixFilePermissions.fromString("rw-r-----"),
+                Files.getPosixFilePermissions(file));
+        jroot.chmod(file.toString(), 0755);
+        assertEquals(PosixFilePermissions.fromString("rwxr-xr-x"),
+                Files.getPosixFilePermissions(file));
+    }
+
+    @Test
+    void truncatesALocalFileInEitherDirection() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        jroot.truncate(file.toString(), 9);
+        assertEquals("the quick", Files.readString(file));
+
+        // Past the end is a hole, not an error: the file grows and the gap
+        // reads back as zeroes.
+        jroot.truncate(file.toString(), 16);
+        assertEquals(16, Files.size(file));
+        assertArrayEquals(new byte[7],
+                java.util.Arrays.copyOfRange(Files.readAllBytes(file), 9, 16));
+    }
+
+    @Test
+    void carriesExtendedAttributesOnALocalFile() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                Files.getFileAttributeView(file, UserDefinedFileAttributeView.class) != null,
+                "this filesystem has no extended attributes");
+
+        byte[] checksum = "adler32:1234".getBytes(StandardCharsets.UTF_8);
+        jroot.setAttribute(file.toString(), "user.checksum", checksum);
+        jroot.setAttribute(file.toString(), "user.run", "1".getBytes(StandardCharsets.UTF_8));
+        assertArrayEquals(checksum,
+                jroot.attribute(file.toString(), "user.checksum").orElseThrow());
+        assertEquals(java.util.Set.of("user.checksum", "user.run"),
+                jroot.attributes(file.toString()).keySet());
+
+        jroot.deleteAttribute(file.toString(), "user.run");
+        assertEquals(java.util.Set.of("user.checksum"),
+                jroot.attributes(file.toString()).keySet());
+        assertTrue(jroot.attribute(file.toString(), "user.run").isEmpty());
+    }
+
+    @Test
+    void copiesALocalTreeContentsFirst() throws IOException {
+        Path source = dir.resolve("run1");
+        Files.createDirectories(source.resolve("sub"));
+        Files.write(source.resolve("a.root"), CONTENT);
+        Files.write(source.resolve("sub/b.root"), CONTENT);
+
+        Path target = dir.resolve("copy");
+        jroot.copyTree(source.toString(), target.toString());
+        assertArrayEquals(CONTENT, Files.readAllBytes(target.resolve("a.root")));
+        assertArrayEquals(CONTENT, Files.readAllBytes(target.resolve("sub/b.root")));
+        assertFalse(Files.exists(target.resolve("run1")), "the source's contents, not the source");
+    }
+
+    @Test
+    void removesALocalTreeAndAPlainFileAlike() throws IOException {
+        Path tree = dir.resolve("run1");
+        Files.createDirectories(tree.resolve("sub"));
+        Files.write(tree.resolve("sub/b.root"), CONTENT);
+        jroot.rmTree(tree.toString());
+        assertFalse(Files.exists(tree));
+
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        jroot.rmTree(file.toString());
+        assertFalse(Files.exists(file));
+    }
+
+    @Test
+    void saysWhichOfTheseHttpHasNoWordFor() {
+        String url = "https://door/store/f.root";
+        assertTrue(assertThrows(XrdException.class, () -> jroot.chmod(url, 0644))
+                .getMessage().contains("no permission bits"));
+        assertTrue(assertThrows(XrdException.class, () -> jroot.truncate(url, 0))
+                .getMessage().contains("not truncate"));
+        assertTrue(assertThrows(XrdException.class, () -> jroot.attributes(url))
+                .getMessage().contains("extended attributes"));
+        assertThrows(XrdException.class, () -> jroot.attribute(url, "user.checksum"));
+        assertThrows(XrdException.class,
+                () -> jroot.setAttribute(url, "user.checksum", CONTENT));
+        assertThrows(XrdException.class, () -> jroot.deleteAttribute(url, "user.checksum"));
     }
 
     // -----------------------------------------------------------------
