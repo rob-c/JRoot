@@ -22,7 +22,9 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import io.github.robc.jroot.http.MockHttpStorage;
+import io.github.robc.jroot.http.MockTapeServer;
 import io.github.robc.jroot.wire.Types.DirEntry;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
@@ -388,6 +390,53 @@ class JRootTest {
                 () -> jroot.thirdPartyCopy("https://door/store/f", dir.resolve("f").toString()));
         assertThrows(XrdException.class,
                 () -> jroot.thirdPartyCopy(dir.resolve("a").toString(), dir.resolve("b").toString()));
+    }
+
+    // -----------------------------------------------------------------
+    // Staging
+    // -----------------------------------------------------------------
+
+    @Test
+    void treatsALocalFileAsAlreadyStaged() throws IOException {
+        Path file = Files.write(dir.resolve("staged.root"), CONTENT);
+        assertEquals("", jroot.stage(List.of(file.toString())));
+        assertEquals("", jroot.stage(List.of(file.toString()), "P1D"));
+        List<PrepareStatus> statuses =
+                jroot.stageStatus("", List.of(file.toString(), dir.resolve("no").toString()));
+        assertTrue(statuses.get(0).online());
+        assertTrue(statuses.get(0).exists());
+        assertFalse(statuses.get(1).exists());
+        assertFalse(statuses.get(1).online());
+        jroot.cancelStage("", List.of(file.toString()));
+    }
+
+    @Test
+    void reportsALocalFileAsOnlineAndNothingAtAllAsMissing() throws IOException {
+        Path file = Files.write(dir.resolve("here.root"), CONTENT);
+        List<PrepareStatus> where =
+                jroot.locality(List.of(file.toString(), dir.resolve("gone").toString()));
+        assertEquals("ONLINE", where.get(0).state());
+        assertFalse(where.get(0).onTape());
+        assertEquals("no such file", where.get(1).error());
+    }
+
+    @Test
+    void hasNothingToDoWithAnEmptyListOfFiles() {
+        assertEquals("", jroot.stage(List.of()));
+        assertTrue(jroot.stageStatus("h", List.of()).isEmpty());
+        assertTrue(jroot.locality(List.of()).isEmpty());
+        jroot.cancelStage("h", List.of());
+    }
+
+    @Test
+    void asksTheServerWhetherAFileIsStillOnTape() throws IOException {
+        try (MockTapeServer server = new MockTapeServer()) {
+            server.answering("/api/v1/tape/archiveinfo", 200,
+                    "[{\"path\":\"/store/cold.root\",\"locality\":\"NEARLINE\"}]");
+            List<PrepareStatus> where = jroot.locality(List.of(server.url("/store/cold.root")));
+            assertTrue(where.get(0).onTape());
+            assertFalse(where.get(0).online());
+        }
     }
 
     @Test

@@ -14,6 +14,7 @@ import java.util.Locale;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.SpaceInfo;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
@@ -256,7 +257,25 @@ public final class Cli {
             }
             case "prepare" -> {
                 require(args, 1, "prepare URL...");
-                out.println(jroot.xrootd().prepare(args, XrdConst.kXR_stage, 1));
+                out.println(jroot.stage(args));
+            }
+            case "prepstat" -> {
+                require(args, 2, "prepstat HANDLE URL...");
+                for (PrepareStatus status : jroot.stageStatus(args.get(0),
+                        args.subList(1, args.size()))) {
+                    out.printf("%-10s %-10s %s%s%n",
+                            status.online() ? "online" : status.onTape() ? "on-tape" : "unknown",
+                            status.state().isEmpty() ? "-" : status.state(), status.path(),
+                            status.error().isEmpty() ? "" : "  " + status.error());
+                }
+            }
+            case "locality" -> {
+                require(args, 1, "locality URL...");
+                for (PrepareStatus status : jroot.locality(args)) {
+                    out.printf("%-20s %s%s%n",
+                            status.state().isEmpty() ? "-" : status.state(), status.path(),
+                            status.error().isEmpty() ? "" : "  " + status.error());
+                }
             }
             case "help" -> usage(out);
             default -> {
@@ -409,7 +428,9 @@ public final class Cli {
                   locate URL             which servers hold a file  (root:// only)
                   space URL              space token usage           (root:// only)
                   query URL ITEM         a configuration item        (root:// only)
-                  prepare URL...         stage files from tape       (root:// only)
+                  prepare URL...         stage files from tape
+                  prepstat HANDLE URL... how that staging is going
+                  locality URL...        whether files are on disk or tape
 
                 urls:
                   root://host[:port]//path        the binary protocol

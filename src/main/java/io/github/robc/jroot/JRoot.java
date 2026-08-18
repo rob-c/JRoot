@@ -24,10 +24,12 @@ import io.github.robc.jroot.client.XrdClient;
 import io.github.robc.jroot.client.XrdFile;
 import io.github.robc.jroot.client.XrdUrl;
 import io.github.robc.jroot.http.HttpStorage;
+import io.github.robc.jroot.http.TapeApi;
 import io.github.robc.jroot.http.WebDav;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.FattrItem;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
@@ -57,6 +59,7 @@ public final class JRoot implements Closeable {
 
     private final Config config;
     private volatile XrdClient xrootd;
+    private volatile TapeApi tape;
     private volatile WebDav webdav;
 
     public JRoot() {
@@ -113,6 +116,21 @@ public final class JRoot implements Closeable {
      *  the WebDAV verbs. */
     public HttpStorage http() {
         return webdav();
+    }
+
+    /** The WLCG Tape REST API client, for the HTTP face of staging. */
+    public TapeApi tape() {
+        TapeApi client = tape;
+        if (client == null) {
+            synchronized (this) {
+                client = tape;
+                if (client == null) {
+                    client = new TapeApi(config);
+                    tape = client;
+                }
+            }
+        }
+        return client;
     }
 
     // -----------------------------------------------------------------
@@ -225,6 +243,104 @@ public final class JRoot implements Closeable {
             });
             case LOCAL -> Optional.empty();
         };
+    }
+
+    // -----------------------------------------------------------------
+    // Staging
+    // -----------------------------------------------------------------
+
+    /**
+     * Ask a tape-backed site to bring these files online, and return the
+     * handle it takes the request down under.
+     *
+     * <p>Over {@code root://} that is {@code kXR_prepare} with
+     * {@code kXR_stage}; over HTTP it is the WLCG Tape REST API. Both return
+     * long before the bytes arrive, which is what {@link #stageStatus} is
+     * for. Local files are already online and have no handle to give.
+     */
+    public String stage(List<String> urls) {
+        return stage(urls, "");
+    }
+
+    /**
+     * As {@link #stage(List)}, asking the site to keep the files on disk for
+     * {@code lifetime} — an ISO 8601 duration such as {@code "P1D"} — once
+     * they arrive. The binary protocol has no field for it, so over
+     * {@code root://} the site's own policy decides either way.
+     */
+    public String stage(List<String> urls, String lifetime) {
+        if (urls.isEmpty()) {
+            return "";
+        }
+        return switch (transportOf(urls.get(0))) {
+            case XROOTD -> xrootd().prepare(urls, XrdConst.kXR_stage, 0);
+            case HTTP -> tape().stage(urls, lifetime);
+            case LOCAL -> "";
+        };
+    }
+
+    /**
+     * How a staging request is going: one status per URL, in the order asked.
+     *
+     * <p>{@code online} is the field worth waiting on. A local file is online
+     * by definition, which is the answer that keeps a copy loop written
+     * against this working when it is pointed at a directory.
+     */
+    public List<PrepareStatus> stageStatus(String handle, List<String> urls) {
+        if (urls.isEmpty()) {
+            return List.of();
+        }
+        return switch (transportOf(urls.get(0))) {
+            case XROOTD -> xrootd().prepareStatus(handle, urls);
+            case HTTP -> tape().status(urls.get(0), handle, urls);
+            case LOCAL -> urls.stream().map(url -> new PrepareStatus(localPath(url).toString(),
+                    Files.exists(localPath(url)), false, Files.exists(localPath(url)),
+                    false, false, "", "", "ONLINE")).toList();
+        };
+    }
+
+    /** Withdraw a staging request, files and all. */
+    public void cancelStage(String handle, List<String> urls) {
+        if (urls.isEmpty()) {
+            return;
+        }
+        switch (transportOf(urls.get(0))) {
+            case XROOTD -> xrootd().cancelPrepare(urls.get(0), handle);
+            case HTTP -> tape().delete(urls.get(0), handle);
+            case LOCAL -> { }
+        }
+    }
+
+    /**
+     * Where each of these files lives — on disk, on tape, or both — without
+     * asking for any of it to move.
+     *
+     * <p>Over HTTP that is one {@code archiveinfo} call. The binary protocol
+     * has no equivalent, so it is answered from {@code kXR_stat}'s
+     * {@code kXR_offline} bit, which is the same question with a coarser
+     * vocabulary: a file is online unless the server says it is not.
+     */
+    public List<PrepareStatus> locality(List<String> urls) {
+        if (urls.isEmpty()) {
+            return List.of();
+        }
+        return switch (transportOf(urls.get(0))) {
+            case HTTP -> tape().archiveInfo(urls);
+            case XROOTD, LOCAL -> urls.stream().map(this::localityOf).toList();
+        };
+    }
+
+    private PrepareStatus localityOf(String url) {
+        Optional<StatInfo> stat = statIfPresent(url);
+        if (stat.isEmpty()) {
+            return new PrepareStatus(url, false, false, false, false, false, "",
+                    "no such file", "");
+        }
+        boolean offline = (stat.get().flags() & XrdConst.kXR_offline) != 0;
+        // The tape API's vocabulary, so that the two schemes answer this
+        // question in the same words as well as in the same shape.
+        return new PrepareStatus(url, true, offline, !offline, false, false, "", "",
+                offline ? "NEARLINE" : "ONLINE");
     }
 
     /** Reachability: a {@code kXR_ping}, or a {@code HEAD} of the URL. */
@@ -994,6 +1110,10 @@ public final class JRoot implements Closeable {
         WebDav dav = webdav;
         if (dav != null) {
             dav.close();
+        }
+        TapeApi staging = tape;
+        if (staging != null) {
+            staging.close();
         }
     }
 

@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import io.github.robc.jroot.XrdProtocolException;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.RedirectInfo;
 import io.github.robc.jroot.wire.Types.SpaceInfo;
@@ -277,5 +278,60 @@ class ResponsesTest {
         assertEquals(40, vfs.utilizationRw());
         assertArrayEquals(new int[] {XrdConst.kXR_isDir, XrdConst.kXR_readable},
                 Responses.parseStatx(new byte[] {XrdConst.kXR_isDir, XrdConst.kXR_readable}));
+    }
+    @Test
+    void readsTheJsonAServerAnswersAPrepareQueryWith() {
+        List<PrepareStatus> statuses = Responses.parsePrepareStatus(utf8("""
+                {"request_id":"7f3","responses":[
+                  {"path":"/store/one","path_exists":1,"on_tape":1,"online":0,
+                   "requested":1,"has_reqid":1,"req_time":"1700000000",
+                   "error_text":"","state":"staging"},
+                  {"path":"/store/two","path_exists":1,"on_tape":0,"online":1,
+                   "requested":0,"has_reqid":0,"req_time":"","error_text":"",
+                   "state":"online"}]}"""),
+                List.of("/store/one", "/store/two"));
+        assertEquals(2, statuses.size());
+        assertTrue(statuses.get(0).onTape());
+        assertFalse(statuses.get(0).online());
+        assertTrue(statuses.get(0).requested());
+        assertEquals("1700000000", statuses.get(0).requestedAt());
+        assertEquals("staging", statuses.get(0).state());
+        assertTrue(statuses.get(1).online());
+        assertFalse(statuses.get(1).hasRequestId());
+    }
+
+    @Test
+    void answersInTheOrderTheCallerAsked() {
+        List<PrepareStatus> statuses = Responses.parsePrepareStatus(utf8(
+                "{\"responses\":[{\"path\":\"/b\",\"online\":true},"
+                        + "{\"path\":\"/a\",\"online\":true}]}"),
+                List.of("/a", "/b"));
+        assertEquals(List.of("/a", "/b"),
+                statuses.stream().map(PrepareStatus::path).toList());
+    }
+
+    @Test
+    void saysSoAboutAPathTheServerNeverMentioned() {
+        List<PrepareStatus> statuses = Responses.parsePrepareStatus(
+                utf8("{\"responses\":[{\"path\":\"/a\",\"online\":true}]}"),
+                List.of("/a", "/missing"));
+        assertTrue(statuses.get(0).online());
+        assertFalse(statuses.get(1).exists());
+        assertEquals("not part of this request", statuses.get(1).error());
+    }
+
+    @Test
+    void takesABareArrayAndAnEmptyBodyAlike() {
+        assertEquals(1, Responses.parsePrepareStatus(
+                utf8("[{\"path\":\"/a\",\"on_tape\":\"yes\"}]"), List.of()).size());
+        assertTrue(Responses.parsePrepareStatus(new byte[0], List.of()).isEmpty());
+        assertEquals("not part of this request",
+                Responses.parsePrepareStatus(new byte[0], List.of("/a")).get(0).error());
+    }
+
+    @Test
+    void refusesAPrepareAnswerThatIsNotJson() {
+        assertThrows(XrdProtocolException.class,
+                () -> Responses.parsePrepareStatus(utf8("staging /store/one"), List.of()));
     }
 }

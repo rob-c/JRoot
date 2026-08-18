@@ -19,6 +19,7 @@ import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.FattrResult;
 import io.github.robc.jroot.wire.Types.LocationInfo;
 import io.github.robc.jroot.wire.Types.OpenInfo;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.RedirectInfo;
 import io.github.robc.jroot.wire.Types.SpaceInfo;
 import io.github.robc.jroot.wire.Types.StatInfo;
@@ -282,6 +283,39 @@ public final class XrdClient implements Closeable {
         return execute(first, (connection, at) -> new String(
                 connection.request(new Requests.Prepare(paths, options, priority, 0, 0)).data(),
                 StandardCharsets.UTF_8).trim());
+    }
+
+    /**
+     * How the staging {@link #prepare} asked for is going ({@code kXR_QPrep}).
+     *
+     * <p>{@code prepare} returns as soon as the server has written the request
+     * down, which for a tape-backed site is a long time before the files are
+     * readable. This is the question with an answer worth waiting on: one
+     * status per URL, in the order asked, each of them online once its bytes
+     * are on disk.
+     */
+    public List<PrepareStatus> prepareStatus(String handle, List<String> urls) {
+        if (urls.isEmpty()) {
+            return List.of();
+        }
+        XrdUrl first = XrdUrl.parse(urls.get(0));
+        List<String> paths = urls.stream().map(u -> XrdUrl.parse(u).path()).toList();
+        String args = handle + "\n" + String.join("\n", paths);
+        return execute(first, (connection, at) -> Responses.parsePrepareStatus(
+                connection.request(new Requests.Query(XrdConst.kXR_QPrep, args)).data(), paths));
+    }
+
+    /**
+     * Withdraw a staging request. The handle takes the place of the path
+     * list, which is what makes this its own method rather than a flag on
+     * {@link #prepare}: cancelling names the request, not the files, and
+     * passing paths here would ask the server to cancel whichever requests
+     * had handles that looked like filenames.
+     */
+    public void cancelPrepare(String url, String handle) {
+        XrdUrl parsed = XrdUrl.parse(url);
+        execute(parsed, (connection, at) -> connection.request(
+                new Requests.Prepare(List.of(handle), XrdConst.kXR_cancel, 0, 0, 0)));
     }
 
     // -----------------------------------------------------------------

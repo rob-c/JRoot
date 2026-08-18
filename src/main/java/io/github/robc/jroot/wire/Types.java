@@ -155,4 +155,25 @@ public final class Types {
 
     /** {@code kXR_fattr} response body. */
     public record FattrResult(int errors, List<FattrItem> items) {}
+
+    /**
+     * How one file's staging is going.
+     *
+     * <p>The same record answers the question over both schemes: over
+     * {@code root://} it is a {@code kXR_query} with {@code kXR_QPrep}, and
+     * over HTTP it is the WLCG Tape REST API, which is a different transport
+     * asking a storage element the same thing. {@code online} is the field
+     * worth waiting on — the bytes are readable now — where {@code onTape}
+     * says they are still where staging fetches them from.
+     */
+    public record PrepareStatus(String path, boolean exists, boolean onTape, boolean online,
+                                boolean requested, boolean hasRequestId, String requestedAt,
+                                String error, String state) {
+
+        /** A file the request asked about and the answer says nothing of. */
+        public static PrepareStatus unanswered(String path) {
+            return new PrepareStatus(path, false, false, false, false, false, "",
+                    "not part of this request", "");
+        }
+    }
 }

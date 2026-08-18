@@ -84,6 +84,9 @@ $ jroot cp -r root://door.example.org//store/run1 /scratch/run1
 $ jroot rm -r root://door.example.org//store/run1
 $ jroot chmod 640 root://door.example.org//store/f.root
 $ jroot xattr root://door.example.org//store/f.root user.checksum
+$ jroot prepare root://door.example.org//store/data/file.root
+$ jroot prepstat 7f3a root://door.example.org//store/data/file.root
+$ jroot locality davs://webdav.example.org/store/data/file.root
 ```
 
 `jroot --help` lists every command and option.
@@ -212,6 +215,23 @@ the `Authorization` header on the way — which is exactly the header a door
 redirecting to a pool needs to keep. Bodies are replayable, so a `PROPFIND` or
 an upload survives the redirect intact.
 
+**Staging from tape** — `jroot.stage(urls)` asks a site to bring files
+online and hands back the handle it took the request down under;
+`stageStatus(handle, urls)` says how each one is getting on, and
+`locality(urls)` asks where a file is now without asking for it to move.
+Over `root://` that is `kXR_prepare` with `kXR_stage`, and then
+`kXR_query` with `kXR_QPrep` — the one query whose answer is JSON rather
+than CGI — with `kXR_cancel` to withdraw a request by naming it rather
+than its files. Over HTTP it is the WLCG Tape REST API, found by asking
+the site for `/.well-known/wlcg-tape-rest-api` and falling back to
+`/api/v1/tape` when nothing is published: `POST /stage` with a disk
+lifetime, `GET /stage/{id}`, `POST /stage/{id}/cancel` for some of the
+files, `DELETE /stage/{id}` for the whole request, `POST /release/{id}`
+to give up the pins, and `POST /archiveinfo` for locality. Both schemes
+answer in the same shape and the same words, so a caller that waits on
+one waits on the other unchanged, and a local file — already online, by
+definition — answers too.
+
 ## Known limitations
 
 - **GSI signed Diffie-Hellman is not implemented.** A server that offers
@@ -229,7 +249,7 @@ an upload survives the redirect intact.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 272 tests
+mvn test           # 316 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

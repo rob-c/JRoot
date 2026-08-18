@@ -3,11 +3,13 @@ package io.github.robc.jroot.wire;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import io.github.robc.jroot.XrdProtocolException;
+import io.github.robc.jroot.util.Json;
 import io.github.robc.jroot.wire.Types.AttnInfo;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
@@ -16,6 +18,7 @@ import io.github.robc.jroot.wire.Types.FattrResult;
 import io.github.robc.jroot.wire.Types.LocationInfo;
 import io.github.robc.jroot.wire.Types.LoginInfo;
 import io.github.robc.jroot.wire.Types.OpenInfo;
+import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.ProtocolInfo;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.RedirectInfo;
@@ -292,6 +295,57 @@ public final class Responses {
         }
         return new ChecksumInfo(text.substring(0, sp).toLowerCase(),
                 text.substring(sp + 1).trim().toLowerCase());
+    }
+
+    /**
+     * {@code kXR_query} with {@code kXR_QPrep}: the staging state of each
+     * file asked about.
+     *
+     * <p>Unlike every other query, this one answers with a JSON document
+     * rather than a packed structure or a CGI string. Keys the server did not
+     * send keep their default and keys this does not know about are ignored,
+     * because the format has gained fields between releases and a client that
+     * insisted on the set it was written against would break on the next one.
+     *
+     * <p>The answer is ordered by {@code paths} when there are any: a file
+     * the reply says nothing about comes back as one the request never named,
+     * rather than being quietly dropped. The caller asked about it, and
+     * silence is an answer they would otherwise have to guess at.
+     */
+    public static List<PrepareStatus> parsePrepareStatus(byte[] data, List<String> paths) {
+        String text = textOf(data).trim();
+        Object document = Json.parse(text.isEmpty() ? "{}" : text);
+        Object entries = document instanceof List ? document
+                : Json.object(document).getOrDefault("responses",
+                        Json.object(document).get("files"));
+        Map<String, PrepareStatus> found = new LinkedHashMap<>();
+        for (Object entry : Json.array(entries)) {
+            String path = Json.text(entry, "path");
+            found.put(path, new PrepareStatus(path,
+                    Json.flag(entry, "path_exists"),
+                    Json.flag(entry, "on_tape"),
+                    Json.flag(entry, "online"),
+                    Json.flag(entry, "requested"),
+                    Json.flag(entry, "has_reqid"),
+                    Json.text(entry, "req_time"),
+                    Json.text(entry, "error_text"),
+                    Json.text(entry, "state")));
+        }
+        return ordered(found, paths);
+    }
+
+    /** One status per path asked about, in that order — which is the shape
+     *  the HTTP tape API answers in too, so it is shared rather than copied. */
+    public static List<PrepareStatus> ordered(Map<String, PrepareStatus> found, List<String> paths) {
+        if (paths.isEmpty()) {
+            return List.copyOf(found.values());
+        }
+        List<PrepareStatus> out = new ArrayList<>(paths.size());
+        for (String path : paths) {
+            PrepareStatus status = found.get(path);
+            out.add(status != null ? status : PrepareStatus.unanswered(path));
+        }
+        return out;
     }
 
     /**
