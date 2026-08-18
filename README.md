@@ -80,6 +80,10 @@ $ jroot cp /scratch/file.root davs://webdav.example.org/store/data/file.root
 $ jroot tpc root://source.example.org//store/f root://target.example.org//store/f
 $ jroot --streams 4 get root://door.example.org//store/data/big.root /scratch/
 $ jroot checksum root://door.example.org//store/f adler32
+$ jroot cp -r root://door.example.org//store/run1 /scratch/run1
+$ jroot rm -r root://door.example.org//store/run1
+$ jroot chmod 640 root://door.example.org//store/f.root
+$ jroot xattr root://door.example.org//store/f.root user.checksum
 ```
 
 `jroot --help` lists every command and option.
@@ -110,6 +114,14 @@ reporting only the last.
   parent, but only when `Config.withDelegateProxy` says it may: delegation
   hands the far end a credential that carries your identity, which is a thing
   to decide rather than to discover.
+- **`sss` — a shared secret.** The keytab named by `--keytab`,
+  `Config.withKeytab`, `$XrdSecSSSKT` or `~/.xrd/sss.keytab`, which must be
+  mode 0600 because it holds cleartext secrets. The credential is the
+  format `XrdSecsss` writes: a 16-byte cleartext header naming the key, then
+  a nonce, a timestamp and the user's name under Blowfish-CFB64 with a CRC-32
+  appended — `bf32`, the same transform that then signs the session's
+  requests. A server that names a key (`n:<name>`) gets that key or an error,
+  never a different one.
 - **`unix`** — the login name and group, for a server that asks for nothing
   better.
 
@@ -134,6 +146,16 @@ and writes (`kXR_readv`, `kXR_writev`), checksummed paged I/O (`kXR_pgread`,
 `stat`/`statx`/`statvfs`, `dirlist` with stat, `mkdir`/`rm`/`rmdir`/`mv`/`chmod`,
 extended attributes (`kXR_fattr`), `locate`, `prepare`, `query`, `set`, `ping`,
 `kXR_gpfile`, and the `login`/`auth`/`protocol`/`endsess` session requests.
+
+**One facade over all three** — `stat`, `list`, `read`, `write`, `copy`,
+`mkdir`, `rm`, `mv`, `chmod`, `truncate` and extended attributes dispatch on
+the URL's scheme, and `copyTree`/`rmTree` walk a whole tree over whichever
+transport it lives on — one `DELETE` for WebDAV, which is recursive by
+definition, and depth-first otherwise, since a directory cannot go until it
+is empty. Opaque data stays after the path on the way down, so a token that
+authorises the parent authorises the children. Where a transport genuinely
+has no such notion — permission bits over HTTP, say — the call says so
+rather than pretending it worked.
 
 **Multiple data streams** — `Config.withDataStreams(n)` binds `n-1` extra
 sockets to a session with `kXR_bind` when a file is first opened, and reads
@@ -183,7 +205,7 @@ an upload survives the redirect intact.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 213 tests
+mvn test           # 243 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a
