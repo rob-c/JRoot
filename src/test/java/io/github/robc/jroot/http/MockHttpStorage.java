@@ -35,6 +35,8 @@ public final class MockHttpStorage implements AutoCloseable {
     private final List<Headers> requestHeaders = new CopyOnWriteArrayList<>();
     private volatile String redirectTo;
     private volatile String copyOutcome = "success: Created";
+    private final java.util.concurrent.atomic.AtomicInteger failFirst =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public MockHttpStorage() throws IOException {
         server = HttpServer.create(
@@ -52,6 +54,12 @@ public final class MockHttpStorage implements AutoCloseable {
 
     public MockHttpStorage put(String path, byte[] content) {
         files.put(path, content);
+        return this;
+    }
+
+    /** Answer the next {@code count} GETs with a 500, as a door under load does. */
+    public MockHttpStorage failingFirstReads(int count) {
+        failFirst.set(count);
         return this;
     }
 
@@ -106,6 +114,10 @@ public final class MockHttpStorage implements AutoCloseable {
                 redirectTo = null;
                 exchange.getResponseHeaders().add("Location", target);
                 exchange.sendResponseHeaders(307, -1);
+                return;
+            }
+            if (method.equals("GET") && failFirst.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                exchange.sendResponseHeaders(500, -1);
                 return;
             }
             switch (method) {

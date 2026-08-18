@@ -65,6 +65,7 @@ public final class JRoot implements Closeable {
     private volatile XrdClient xrootd;
     private volatile TapeApi tape;
     private volatile Transfer transfer;
+    private volatile Async async;
     private volatile WebDav webdav;
 
     public JRoot() {
@@ -122,6 +123,31 @@ public final class JRoot implements Closeable {
      * a checksum comparison at the end. {@link #copy} is the plain byte pump;
      * this is what {@code xrdcp} does with the same two URLs.
      */
+    /**
+     * The same operations on a pool, answered with futures. The pool is made
+     * on first use and shut down when this client is closed; a caller with
+     * its own executor passes it to {@link #async(java.util.concurrent.ExecutorService)}
+     * instead and keeps the running of it.
+     */
+    public Async async() {
+        Async existing = async;
+        if (existing == null) {
+            synchronized (this) {
+                existing = async;
+                if (existing == null) {
+                    existing = new Async(this, Async.pool(Async.DEFAULT_THREADS), true);
+                    async = existing;
+                }
+            }
+        }
+        return existing;
+    }
+
+    /** The asynchronous face of this client, on an executor of your own. */
+    public Async async(java.util.concurrent.ExecutorService pool) {
+        return new Async(this, pool, false);
+    }
+
     public Transfer transfer() {
         Transfer engine = transfer;
         if (engine == null) {
@@ -243,6 +269,39 @@ public final class JRoot implements Closeable {
             case HTTP -> webdav().list(url);
             case LOCAL -> localList(localPath(url));
         };
+    }
+
+    /**
+     * Everything under {@code url}, depth first, with each entry named by its
+     * path relative to {@code url} rather than by its own name — which is
+     * what makes the answer usable: a bare name three levels down says
+     * nothing about where it is. Directories are listed as well as descended
+     * into, since an empty one is part of the tree too.
+     *
+     * <p>A directory that will not list is skipped rather than fatal: a
+     * listing of a federation where one site is down is still worth having,
+     * and stopping would report nothing at all.
+     */
+    public List<DirEntry> listTree(String url) {
+        List<DirEntry> found = new ArrayList<>();
+        listInto(url, "", found);
+        return found;
+    }
+
+    private void listInto(String url, String prefix, List<DirEntry> into) {
+        List<DirEntry> entries;
+        try {
+            entries = list(url);
+        } catch (XrdException e) {
+            return;
+        }
+        for (DirEntry entry : entries) {
+            String path = prefix.isEmpty() ? entry.name() : prefix + "/" + entry.name();
+            into.add(new DirEntry(path, entry.parent(), entry.stat()));
+            if (entry.isDirectory()) {
+                listInto(child(url, entry.name()), path, into);
+            }
+        }
     }
 
     /**
@@ -829,7 +888,7 @@ public final class JRoot implements Closeable {
      * A child of {@code url}, with whatever opaque data the parent carried
      * kept where it belongs — after the path, not inside it.
      */
-    static String child(String url, String name) {
+    public static String child(String url, String name) {
         int query = url.indexOf('?');
         String path = query < 0 ? url : url.substring(0, query);
         String cgi = query < 0 ? "" : url.substring(query);
@@ -1156,6 +1215,10 @@ public final class JRoot implements Closeable {
         WebDav dav = webdav;
         if (dav != null) {
             dav.close();
+        }
+        Async pooled = async;
+        if (pooled != null) {
+            pooled.close();
         }
         TapeApi staging = tape;
         if (staging != null) {

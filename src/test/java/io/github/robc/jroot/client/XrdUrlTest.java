@@ -122,4 +122,21 @@ class XrdUrlTest {
         assertEquals("root://rcurrie@door:1094//store/f",
                 XrdUrl.parse("root://rcurrie@door//store/f").toString());
     }
+
+    @Test
+    void pointsAtTheAddressALocateAnsweredWith() {
+        XrdUrl url = XrdUrl.parse("root://redirector:1094//store/f?authz=abc");
+
+        assertEquals("root://data.example:2094//store/f?authz=abc",
+                url.at("data.example:2094").toString());
+
+        XrdUrl six = url.at("[2001:db8::1]:2094");
+        assertEquals("2001:db8::1", six.host());
+        assertEquals(2094, six.port());
+
+        // No port, and a port that is not a number, fall back to the default.
+        assertEquals(XrdConst.DEFAULT_PORT, url.at("data.example").port());
+        assertEquals("data.example", url.at("data.example").host());
+        assertEquals(XrdConst.DEFAULT_PORT, url.at("data.example:not-a-port").port());
+    }
 }

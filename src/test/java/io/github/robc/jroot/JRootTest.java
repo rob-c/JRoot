@@ -444,4 +444,32 @@ class JRootTest {
         assertTrue(jroot.toString().startsWith("JRoot["));
         assertTrue(JRoot.open(Config.defaults()).config() != null);
     }
+
+    @Test
+    void listsAWholeTreeByPathRatherThanByName() throws IOException {
+        Files.createDirectories(dir.resolve("run/raw/day1"));
+        Files.createDirectories(dir.resolve("run/empty"));
+        Files.write(dir.resolve("run/raw/day1/a.root"), CONTENT);
+        Files.write(dir.resolve("run/summary.root"), CONTENT);
+
+        List<String> found = jroot.listTree(dir.resolve("run").toString()).stream()
+                .map(DirEntry::name).sorted().toList();
+
+        assertEquals(List.of("empty", "raw", "raw/day1", "raw/day1/a.root",
+                "summary.root"), found);
+    }
+
+    @Test
+    void listsWhatItCanOfATreeWithADirectoryItCannotRead() throws IOException {
+        Path closed = Files.createDirectories(dir.resolve("tree/closed"));
+        Files.write(dir.resolve("tree/open.root"), CONTENT);
+        Files.write(closed.resolve("hidden.root"), CONTENT);
+        assertTrue(closed.toFile().setReadable(false), "cannot close a directory here");
+
+        List<String> found = jroot.listTree(dir.resolve("tree").toString()).stream()
+                .map(DirEntry::name).sorted().toList();
+        assertTrue(closed.toFile().setReadable(true));
+
+        assertEquals(List.of("closed", "open.root"), found);
+    }
 }

@@ -195,12 +195,16 @@ public final class Cli {
             case "cp" -> {
                 require(args, 2, "cp SOURCE DEST");
                 if (recursive) {
-                    jroot.copyTree(args.get(0), args.get(1));
-                    out.println(args.get(1) + ": written");
-                } else {
-                    out.println(jroot.transfer().run(
-                            plan(jroot, args.subList(0, 1), args.get(1))));
+                    Transfer.TreeResult tree = jroot.transfer().copyTree(args.get(0),
+                            args.get(1), plan(jroot, args.subList(0, 1), args.get(1)));
+                    out.println(tree);
+                    for (Transfer.TreeResult.Failure failure : tree.failures()) {
+                        err.println("jroot: " + failure.source() + ": " + failure.reason());
+                    }
+                    return tree.failures().isEmpty() ? 0 : 1;
                 }
+                out.println(jroot.transfer().run(
+                        plan(jroot, args.subList(0, 1), args.get(1))));
             }
             case "xcp" -> {
                 require(args, 2, "xcp SOURCE... DEST");
@@ -277,7 +281,10 @@ public final class Cli {
             }
             case "locate" -> {
                 require(args, 1, "locate URL");
-                for (LocationInfo location : jroot.xrootd().locate(args.get(0))) {
+                List<LocationInfo> where = recursive
+                        ? jroot.xrootd().deepLocate(args.get(0))
+                        : jroot.xrootd().locate(args.get(0));
+                for (LocationInfo location : where) {
                     out.println(location.address() + "\t" + location.type()
                             + location.access());
                 }
@@ -356,7 +363,7 @@ public final class Cli {
     }
 
     private void list(JRoot jroot, String url) {
-        List<DirEntry> entries = jroot.list(url);
+        List<DirEntry> entries = recursive ? jroot.listTree(url) : jroot.list(url);
         for (DirEntry entry : entries) {
             if (!longListing) {
                 out.println(entry.name());
@@ -488,12 +495,13 @@ public final class Cli {
                 usage: jroot [options] COMMAND [arguments]
 
                 commands:
-                  ls URL                 list a directory
+                  ls URL                 list a directory (-R for a whole tree)
                   stat URL               size, flags and modification time
                   cat URL                write a file to standard output
                   get URL [DEST]         download a file
                   put FILE URL           upload a file
                   cp SOURCE DEST         copy between any two URLs, checksummed
+                                         (-r copies a tree, several files at once)
                   xcp SOURCE... DEST     copy from every replica at once
                   tpc SOURCE DEST        server-to-server copy
                   zip URL                list the members of a ZIP archive
@@ -508,6 +516,7 @@ public final class Cli {
                   checksum URL [ALG]     the checksum the server holds
                   ping URL               round-trip time to a server
                   locate URL             which servers hold a file  (root:// only)
+                                         (-r follows the managers down)
                   space URL              space token usage           (root:// only)
                   query URL ITEM         a configuration item        (root:// only)
                   prepare URL...         stage files from tape
@@ -532,7 +541,7 @@ public final class Cli {
                 options:
                   -l, --long             a long listing
                   -p, --parents          create missing parent directories
-                  -r, -R, --recursive    for cp and rm, work on whole trees
+                  -r, -R, --recursive    whole trees for ls, cp and rm; a deep locate
                   --token VALUE          a bearer token (else the WLCG discovery order)
                   --proxy PATH           an X.509 proxy (else $X509_USER_PROXY)
                   --ca PATH              the CA directory (else $X509_CERT_DIR)

@@ -83,6 +83,17 @@ jroot.webdav().thirdPartyCopy(source, target, /* pull */ true,
 List<LocationInfo> replicas = jroot.xrootd().locate("root://redirector//store/f");
 ```
 
+Nothing here blocks a caller who does not want it to. `jroot.async()` is the
+same client answered with futures, and XRootD multiplexes requests over one
+connection per server, so a hundred outstanding calls to one door are a
+hundred requests in flight on one socket:
+
+```java
+List<CompletableFuture<StatInfo>> all = urls.stream()
+        .map(jroot.async()::stat).toList();
+CompletableFuture.allOf(all.toArray(CompletableFuture[]::new)).join();
+```
+
 Configuration is an immutable record with a `with…` for each field:
 
 ```java
@@ -201,6 +212,13 @@ and writes (`kXR_readv`, `kXR_writev`), checksummed paged I/O (`kXR_pgread`,
 extended attributes (`kXR_fattr`), `locate`, `prepare`, `query`, `set`, `ping`,
 `kXR_gpfile`, and the `login`/`auth`/`protocol`/`endsess` session requests.
 
+**Deep locate** — a federation is a tree of redirectors, so one `kXR_locate`
+answers with the managers below rather than with replicas. `deepLocate`
+follows it down to the data servers actually holding the file, visiting no
+manager twice and treating one that will not answer as a gap rather than a
+failure. It is what a copy asks before deciding where to read from, and what
+`jroot locate -r` prints.
+
 **One facade over all three** — `stat`, `list`, `read`, `write`, `copy`,
 `mkdir`, `rm`, `mv`, `chmod`, `truncate` and extended attributes dispatch on
 the URL's scheme, and `copyTree`/`rmTree` walk a whole tree over whichever
@@ -287,6 +305,18 @@ order. An HTTP destination is written by one `PUT` of the whole object, so
 those copies land on local disk first and upload from there — the parallel
 read still pays for itself.
 
+A whole tree is copied several files at a time, since a run directory is
+spent on round trips rather than on bandwidth, and a file that will not copy
+is recorded and the walk goes on — one unreadable file should not undo a good
+copy of the other five thousand, so the failures come back in the result
+rather than as an exception halfway through.
+
+A transfer that does not finish leaves nothing behind. A file that is part of
+a file is the dangerous kind of wrong — plausible name, plausible size, not
+the data — so a copy that fails, or fails to verify, takes its destination
+away again, which is what `kXR_posc` asks a server to do and what `xrdcp`
+does for itself where the server will not.
+
 **Metalink** — RFC 5854 (`.meta4`) and the older metalink 3, parsed into the
 replicas they name, sorted by the publisher's priority, with the strongest
 hash they carry taken as the expected checksum.
@@ -318,7 +348,7 @@ URL is accepted.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 372 tests
+mvn test           # 391 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

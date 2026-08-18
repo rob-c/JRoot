@@ -185,6 +185,30 @@ public final class XrdUrl {
     }
 
     /** The same URL pointed at a different server, as a redirect gives it. */
+    /**
+     * This URL pointed at the address {@code kXR_locate} answered with, which
+     * is {@code host:port} — and IPv6 wears brackets there as it does in a
+     * URL, so the port is the colon after the last bracket rather than the
+     * first colon in the string. An address with no port, or one whose port
+     * is not a number, falls back to the protocol's default.
+     */
+    public XrdUrl at(String address) {
+        int colon = address.lastIndexOf(':');
+        int bracket = address.lastIndexOf(']');
+        if (colon < 0 || colon < bracket) {
+            return at(address, XrdConst.DEFAULT_PORT, false);
+        }
+        String host = address.substring(0, colon);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        try {
+            return at(host, Integer.parseInt(address.substring(colon + 1)), false);
+        } catch (NumberFormatException e) {
+            return at(address, XrdConst.DEFAULT_PORT, false);
+        }
+    }
+
     public XrdUrl at(String host, int port, boolean tls) {
         return new XrdUrl(tls ? "roots" : "root", user,
                 List.of(new Endpoint(host, port)), path, cgi);

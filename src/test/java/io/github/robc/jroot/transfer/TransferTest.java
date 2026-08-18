@@ -1,5 +1,6 @@
 package io.github.robc.jroot.transfer;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -22,10 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import io.github.robc.jroot.JRoot;
 import io.github.robc.jroot.XrdException;
-import io.github.robc.jroot.client.XrdUrl;
 import io.github.robc.jroot.http.MockHttpStorage;
-import io.github.robc.jroot.wire.Types.LocationInfo;
-import io.github.robc.jroot.wire.XrdConst;
 
 /**
  * The copy engine: chunks drawn from whichever replica answers, written
@@ -132,6 +130,22 @@ class TransferTest {
     }
 
     @Test
+    void triesAReplicaAgainAfterItHasAMoment() throws IOException {
+        try (MockHttpStorage storage = new MockHttpStorage()) {
+            storage.put("/store/flaky.root", content).failingFirstReads(2);
+            Path target = dir.resolve("recovered.root");
+            Transfer.Result result = transfer.run(
+                    Transfer.Plan.of(storage.url("/store/flaky.root"), target.toString())
+                            .withChunkSize(32768)
+                            .withParallel(1)
+                            .withRetries(4));
+
+            assertArrayEquals(content, Files.readAllBytes(target));
+            assertEquals(content.length, result.bytes());
+        }
+    }
+
+    @Test
     void givesUpWhenNoReplicaOpensAtAll() {
         XrdException failure = assertThrows(XrdException.class,
                 () -> transfer.copy(dir.resolve("gone.root").toString(),
@@ -177,6 +191,32 @@ class TransferTest {
                         .withExpected("deadbeef")));
         assertTrue(failure.getMessage().contains("deadbeef"), failure.getMessage());
         assertTrue(failure.getMessage().contains("not the file"), failure.getMessage());
+    }
+
+    @Test
+    void leavesNothingBehindWhenTheChecksumIsWrong() {
+        Path target = dir.resolve("half.root");
+        assertThrows(XrdException.class,
+                () -> transfer.run(Transfer.Plan.of(file.toString(), target.toString())
+                        .withExpected("deadbeef")));
+        assertFalse(Files.exists(target), "a file that is not the file was left behind");
+    }
+
+    @Test
+    void leavesNothingBehindWhenTheSourceGivesOutHalfWay() throws IOException {
+        try (MockHttpStorage storage = new MockHttpStorage()) {
+            storage.put("/store/short.root", content).failingFirstReads(0);
+            Path target = dir.resolve("truncated.root");
+            // Two chunks in, the door stops answering for good.
+            storage.failingFirstReads(1000);
+            assertThrows(XrdException.class,
+                    () -> transfer.run(
+                            Transfer.Plan.of(storage.url("/store/short.root"), target.toString())
+                                    .withChunkSize(8192)
+                                    .withParallel(1)
+                                    .withRetries(1)));
+            assertFalse(Files.exists(target), "half a file was left behind");
+        }
     }
 
     @Test
@@ -281,32 +321,64 @@ class TransferTest {
                 transfer.resolve(Transfer.Plan.of("https://door/store/f", "/tmp/f")).sources());
     }
 
+    // -----------------------------------------------------------------
+    // A whole tree
+    // -----------------------------------------------------------------
+
     @Test
-    void readsTheAddressAServerWasLocatedAt() {
-        XrdUrl url = XrdUrl.parse("root://redirector:1094//store/f?authz=abc");
+    void copiesATreeSeveralFilesAtATime() throws IOException {
+        Path tree = Files.createDirectories(dir.resolve("run1/raw/day1"));
+        Files.createDirectories(dir.resolve("run1/logs"));
+        for (int i = 0; i < 12; i++) {
+            Files.write(tree.resolve("f" + i + ".root"), ("event " + i).getBytes(UTF_8));
+        }
+        Files.write(dir.resolve("run1/logs/job.log"), "ran".getBytes(UTF_8));
+        Files.write(dir.resolve("run1/summary.root"), content);
 
-        assertEquals("root://data.example:2094//store/f?authz=abc",
-                Transfer.at(url, location("data.example:2094")).toString());
+        Path target = dir.resolve("copied");
+        Transfer.TreeResult result = transfer.copyTree(dir.resolve("run1").toString(),
+                target.toString(), Transfer.Plan.of(List.of(), "").withParallel(4));
 
-        XrdUrl six = Transfer.at(url, location("[2001:db8::1]:2094"));
-        assertEquals("2001:db8::1", six.host());
-        assertEquals(2094, six.port());
-
-        // No port, and a port that is not a number, both fall back to 1094.
-        assertEquals(XrdConst.DEFAULT_PORT, Transfer.at(url, location("data.example")).port());
-        assertEquals("data.example", Transfer.at(url, location("data.example")).host());
-        assertEquals(XrdConst.DEFAULT_PORT,
-                Transfer.at(url, location("data.example:not-a-port")).port());
+        assertEquals(14, result.files());
+        assertTrue(result.failures().isEmpty(), result.failures().toString());
+        assertArrayEquals(content, Files.readAllBytes(target.resolve("summary.root")));
+        assertEquals("event 7",
+                Files.readString(target.resolve("raw/day1/f7.root")));
+        assertEquals("ran", Files.readString(target.resolve("logs/job.log")));
+        assertTrue(Files.isDirectory(target.resolve("raw/day1")));
+        assertTrue(result.bytes() > content.length);
     }
 
     @Test
-    void takesOnlyTheDataServersOutOfALocateAnswer() {
-        assertFalse(new LocationInfo("manager:1094", 'M', 'r').isServer());
-        assertTrue(new LocationInfo("data:1094", 'S', 'w').isServer());
+    void copiesTheRestOfATreeWhenOneFileWillNotGo() throws IOException {
+        Path tree = Files.createDirectories(dir.resolve("run2"));
+        Files.write(tree.resolve("good.root"), content);
+        Path bad = Files.write(tree.resolve("bad.root"), content);
+        assertTrue(bad.toFile().setReadable(false), "cannot make a file unreadable here");
+
+        Path target = dir.resolve("partial");
+        Transfer.TreeResult result =
+                transfer.copyTree(tree.toString(), target.toString(),
+                        Transfer.Plan.of(List.of(), "").withParallel(2));
+
+        assertEquals(1, result.files());
+        assertEquals(1, result.failures().size());
+        assertTrue(result.failures().get(0).source().endsWith("bad.root"),
+                result.failures().toString());
+        assertArrayEquals(content, Files.readAllBytes(target.resolve("good.root")));
+        assertTrue(result.toString().contains("1 failed"), result.toString());
+        assertTrue(bad.toFile().setReadable(true));
     }
 
-    private static LocationInfo location(String address) {
-        return new LocationInfo(address, 'S', 'r');
+    @Test
+    void copiesASingleFileWhenTheTreeIsOne() throws IOException {
+        Path target = dir.resolve("one.root");
+        Transfer.TreeResult result = transfer.copyTree(file.toString(), target.toString());
+
+        assertEquals(1, result.files());
+        assertEquals(content.length, result.bytes());
+        assertArrayEquals(content, Files.readAllBytes(target));
+        assertTrue(result.toString().startsWith("1 file,"), result.toString());
     }
 
     // -----------------------------------------------------------------

@@ -4,9 +4,14 @@ import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import io.github.robc.jroot.Config;
@@ -194,6 +199,48 @@ public final class XrdClient implements Closeable {
     public List<LocationInfo> locate(XrdUrl url, int options) {
         return execute(url, (connection, at) -> Responses.parseLocate(
                 connection.request(new Requests.Locate(at.pathWithCgi(), options)).data()));
+    }
+
+    /**
+     * Every data server holding the file, asked of the managers in the way.
+     *
+     * <p>A federation is a tree of redirectors: {@code kXR_locate} at the top
+     * answers with the managers below it, and only the leaves answer with
+     * servers. One locate is therefore a list of places to ask rather than a
+     * list of replicas, and the answer worth having is what comes back from
+     * following it down — which is what {@code XrdCl}'s deep locate does, and
+     * what a copy wants before it decides where to read from.
+     *
+     * <p>Managers already visited are not visited twice, since a federation
+     * may name the same one from two places, and a manager that will not
+     * answer is skipped rather than fatal: the replicas found elsewhere are
+     * still worth returning.
+     */
+    public List<LocationInfo> deepLocate(String url) {
+        XrdUrl parsed = XrdUrl.parse(url);
+        List<LocationInfo> servers = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        Deque<XrdUrl> toAsk = new ArrayDeque<>(List.of(parsed));
+        while (!toAsk.isEmpty()) {
+            XrdUrl at = toAsk.poll();
+            List<LocationInfo> answer;
+            try {
+                answer = locate(at, 0);
+            } catch (XrdException e) {
+                continue;               // one silent manager is not the whole tree
+            }
+            for (LocationInfo location : answer) {
+                if (!seen.add(location.type() + location.address())) {
+                    continue;
+                }
+                if (location.isManager()) {
+                    toAsk.add(at.at(location.address()));
+                } else if (location.isServer()) {
+                    servers.add(location);
+                }
+            }
+        }
+        return servers;
     }
 
     public ChecksumInfo checksum(String url) {

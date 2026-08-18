@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -21,11 +22,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.robc.jroot.JRoot;
 import io.github.robc.jroot.XrdException;
+import io.github.robc.jroot.XrdServerException;
 import io.github.robc.jroot.client.XrdUrl;
 import io.github.robc.jroot.util.Env;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
+import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
-import io.github.robc.jroot.wire.XrdConst;
 import io.github.robc.jroot.zip.ZipArchive;
 
 /**
@@ -144,6 +146,11 @@ public final class Transfer {
             return new Plan(value, target, chunkSize, parallel, retries, verify, algorithm,
                     expected, progress);
         }
+
+        public Plan withTarget(String value) {
+            return new Plan(sources, value, chunkSize, parallel, retries, verify, algorithm,
+                    expected, progress);
+        }
     }
 
     /** Big enough to amortise a round trip, small enough to spread evenly. */
@@ -194,17 +201,44 @@ public final class Transfer {
         return plan;
     }
 
+    /**
+     * Run a copy, and leave nothing behind if it does not finish.
+     *
+     * <p>A transfer that fails part way through has written part of a file,
+     * and a file that is part of a file is the dangerous kind of wrong: it
+     * has a plausible name and a plausible size and it is not the data. The
+     * destination is therefore removed when the copy fails or fails to
+     * verify — which is what {@code kXR_posc} asks a server to do, and what
+     * {@code xrdcp} does for itself where the server will not. The removal
+     * is best-effort: if it too fails, the transfer's own failure is still
+     * the one raised, since that is the one worth reading.
+     */
     public Result run(Plan plan) {
         Plan resolved = resolve(plan);
         if (resolved.sources().isEmpty()) {
             throw new XrdException("a copy needs a source");
         }
         long started = System.nanoTime();
-        long bytes = JRoot.transportOf(resolved.target()) == JRoot.Transport.HTTP
-                ? throughATemporaryFile(resolved)
-                : pull(resolved, resolved.target());
-        Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
-        return verify(resolved, bytes, elapsed);
+        try {
+            long bytes = JRoot.transportOf(resolved.target()) == JRoot.Transport.HTTP
+                    ? throughATemporaryFile(resolved)
+                    : pull(resolved, resolved.target());
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+            return verify(resolved, bytes, elapsed);
+        } catch (RuntimeException e) {
+            removeQuietly(resolved.target());
+            throw e;
+        }
+    }
+
+    /** Take away what was written, without burying why it was written badly. */
+    private void removeQuietly(String target) {
+        try {
+            jroot.rm(target);
+        } catch (RuntimeException ignored) {
+            // Nothing was written, or it cannot be taken away. Either way the
+            // failure that got us here is the one to report.
+        }
     }
 
     /**
@@ -302,6 +336,97 @@ public final class Transfer {
     }
 
     // -----------------------------------------------------------------
+    // A whole tree
+    // -----------------------------------------------------------------
+
+    /** What a tree copy amounted to, including the parts of it that did not. */
+    public record TreeResult(int files, long bytes, Duration elapsed,
+                             List<Failure> failures) {
+
+        public record Failure(String source, String reason) { }
+
+        @Override
+        public String toString() {
+            return String.format("%d file%s, %d bytes in %.1fs%s", files,
+                    files == 1 ? "" : "s", bytes, elapsed.toNanos() / 1e9,
+                    failures.isEmpty() ? "" : ", " + failures.size() + " failed");
+        }
+    }
+
+    /**
+     * Copy a whole tree, several files at a time. A directory is created at
+     * the far end and its children copied into it — the {@code cp -r src/. dst}
+     * sense, as {@link JRoot#copyTree} has it — and {@code plan.parallel()}
+     * says how many files are in flight at once, since a tree of small files
+     * is spent on round trips rather than on bandwidth.
+     *
+     * <p>A file that will not copy is recorded and the walk goes on. One
+     * unreadable file in a run directory should not undo a good copy of the
+     * other five thousand, so the failures come back in the result and it is
+     * the caller's business to look at them.
+     */
+    public TreeResult copyTree(String source, String target, Plan template) {
+        long started = System.nanoTime();
+        List<String[]> files = new ArrayList<>();
+        walk(source, target, files);
+        AtomicLong bytes = new AtomicLong();
+        List<TreeResult.Failure> failures =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+        int width = Math.max(1, Math.min(template.parallel(), Math.max(1, files.size())));
+        ExecutorService pool = pool(width);
+        try {
+            List<Future<?>> running = new ArrayList<>(files.size());
+            for (String[] pair : files) {
+                running.add(pool.submit(() -> {
+                    try {
+                        // One file at a time inside a tree: the parallelism
+                        // is spent on the files themselves.
+                        bytes.addAndGet(run(template.withSources(List.of(pair[0]))
+                                .withTarget(pair[1]).withParallel(1)).bytes());
+                    } catch (XrdException e) {
+                        failures.add(new TreeResult.Failure(pair[0], e.getMessage()));
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> part : running) {
+                settle(part, target);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        return new TreeResult(files.size() - failures.size(), bytes.get(),
+                Duration.ofNanos(System.nanoTime() - started), List.copyOf(failures));
+    }
+
+    public TreeResult copyTree(String source, String target) {
+        return copyTree(source, target, plan(List.of(source), target));
+    }
+
+    /**
+     * Every file under {@code source}, paired with where it belongs under
+     * {@code target}, with the directories made on the way down — a file
+     * cannot be written into a directory that is not there yet, and making
+     * them as the walk goes keeps that in one place.
+     */
+    private void walk(String source, String target, List<String[]> into) {
+        if (!jroot.stat(source).isDirectory()) {
+            into.add(new String[] {source, target});
+            return;
+        }
+        jroot.mkdir(target, true);
+        for (DirEntry entry : jroot.list(source)) {
+            String from = JRoot.child(source, entry.name());
+            String to = JRoot.child(target, entry.name());
+            if (entry.isDirectory()) {
+                walk(from, to, into);
+            } else {
+                into.add(new String[] {from, to});
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Where the sources come from
     // -----------------------------------------------------------------
 
@@ -371,20 +496,20 @@ public final class Transfer {
     }
 
     /**
-     * Every data server holding this file, as URLs. A manager answers
-     * {@code kXR_locate} with the lot; a data server answers with itself, in
-     * which case there is nothing to spread and the URL is left alone.
+     * Every data server holding this file, as URLs, with the managers in
+     * the way followed down. A data server answers with itself, in which
+     * case there is nothing to spread and the URL is left alone.
      */
     List<String> spread(String url) {
         List<String> found = new ArrayList<>();
         try {
             XrdUrl parsed = XrdUrl.parse(url);
             Set<String> seen = new LinkedHashSet<>();
-            for (LocationInfo location : jroot.xrootd().locate(url)) {
+            for (LocationInfo location : jroot.xrootd().deepLocate(url)) {
                 if (!location.isServer() || !seen.add(location.address())) {
                     continue;
                 }
-                found.add(at(parsed, location).toString());
+                found.add(parsed.at(location.address()).toString());
             }
         } catch (XrdException e) {
             // A server that will not answer kXR_locate is a server that
@@ -392,29 +517,6 @@ public final class Transfer {
             return List.of(url);
         }
         return found.isEmpty() ? List.of(url) : found;
-    }
-
-    /**
-     * {@code kXR_locate} answers with {@code host:port}, and IPv6 wears
-     * brackets there as it does in a URL, so the port is the colon after the
-     * last bracket rather than the first colon in the string.
-     */
-    static XrdUrl at(XrdUrl url, LocationInfo location) {
-        String address = location.address();
-        int colon = address.lastIndexOf(':');
-        int bracket = address.lastIndexOf(']');
-        if (colon < 0 || colon < bracket) {
-            return url.at(address, XrdConst.DEFAULT_PORT, false);
-        }
-        String host = address.substring(0, colon);
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        try {
-            return url.at(host, Integer.parseInt(address.substring(colon + 1)), false);
-        } catch (NumberFormatException e) {
-            return url.at(address, XrdConst.DEFAULT_PORT, false);
-        }
     }
 
     // -----------------------------------------------------------------
@@ -500,12 +602,25 @@ public final class Transfer {
      * The replicas of one file, opened as they are first needed and dropped
      * as they fail. Chunks are handed out round-robin, so a slow replica
      * carries fewer of them without anybody having to measure it.
+     *
+     * <p>A replica that fails goes back on the queue rather than out of the
+     * list, because most failures are the network having a moment rather
+     * than the file being gone — and a copy with one source would otherwise
+     * die of a single dropped connection. It leaves for good once it has
+     * failed {@link #GIVE_UP_AFTER} times, which is what tells a broken
+     * replica apart from an unlucky one.
      */
     private static final class Replicas {
 
+        /** Failures at one replica before it is written off. */
+        private static final int GIVE_UP_AFTER = 3;
+
+        private record Held(String url, Source source) { }
+
         private final JRoot jroot;
         private final Deque<String> pending;
-        private final List<Source> open = new ArrayList<>();
+        private final List<Held> open = new ArrayList<>();
+        private final Map<String, Integer> failures = new HashMap<>();
         private final AtomicInteger next = new AtomicInteger();
         private final int maxOpen;
         private XrdException lastFailure;
@@ -524,7 +639,7 @@ public final class Transfer {
          */
         synchronized long size() {
             if (size == Long.MIN_VALUE) {
-                size = pick().size();
+                size = pick().source().size();
             }
             return size;
         }
@@ -532,12 +647,12 @@ public final class Transfer {
         byte[] read(long offset, int length, int retries) {
             XrdException last = null;
             for (int attempt = 0; attempt <= Math.max(retries, 0); attempt++) {
-                Source source = pick();
+                Held held = pick();
                 try {
-                    return source.read(offset, length);
+                    return held.source().read(offset, length);
                 } catch (XrdException e) {
                     last = e;
-                    drop(source);
+                    drop(held);
                 }
             }
             throw last != null ? last : new XrdException(
@@ -549,7 +664,7 @@ public final class Transfer {
          * fewer open than there are chunks in flight, so the connections
          * grow to the width of the transfer and no further.
          */
-        private synchronized Source pick() {
+        private synchronized Held pick() {
             if (open.size() < maxOpen) {
                 openOneMore();
             }
@@ -565,29 +680,43 @@ public final class Transfer {
             while (!pending.isEmpty()) {
                 String url = pending.poll();
                 try {
-                    open.add(jroot.source(url));
+                    open.add(new Held(url, jroot.source(url)));
                     return;
                 } catch (XrdException e) {
                     lastFailure = e;
+                    retryLater(url, e);
                 }
             }
         }
 
-        private synchronized void drop(Source source) {
-            if (!open.remove(source)) {
-                return;                 // another thread got there first
-            }
-            try {
-                source.close();
-            } catch (RuntimeException ignored) {
-                // It was already failing; how it closes is not the news.
+        /**
+         * Put a replica back at the end of the queue unless it has failed
+         * often enough to have earned its place off it.
+         */
+        private void retryLater(String url, XrdException failure) {
+            int failed = failures.merge(url, 1, Integer::sum);
+            if (failed < GIVE_UP_AFTER && !(failure instanceof XrdServerException server
+                    && server.isNotFound())) {
+                pending.addLast(url);
             }
         }
 
+        private synchronized void drop(Held held) {
+            if (!open.remove(held)) {
+                return;                 // another thread got there first
+            }
+            try {
+                held.source().close();
+            } catch (RuntimeException ignored) {
+                // It was already failing; how it closes is not the news.
+            }
+            retryLater(held.url(), new XrdException("read failed"));
+        }
+
         synchronized void close() {
-            for (Source source : open) {
+            for (Held held : open) {
                 try {
-                    source.close();
+                    held.source().close();
                 } catch (RuntimeException ignored) {
                     // Nothing left to do about it.
                 }
