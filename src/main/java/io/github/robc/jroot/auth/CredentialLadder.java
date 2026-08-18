@@ -87,7 +87,7 @@ public final class CredentialLadder {
     private static Optional<? extends Credential> build(SecurityOffer offer, Config config) {
         return switch (offer.name()) {
             case "ztn" -> TokenCredential.available(offer, config.token());
-            case "gsi" -> GsiCredential.available(offer, config.proxyPath());
+            case "gsi" -> GsiCredential.available(offer, config);
             case "unix" -> config.allowUnix()
                     ? Optional.of(new UnixCredential(config.username(), config.username()))
                     : Optional.empty();

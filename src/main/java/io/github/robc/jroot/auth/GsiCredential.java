@@ -10,11 +10,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdAuthException;
 import io.github.robc.jroot.auth.GsiMessage.Bucket;
 import io.github.robc.jroot.crypto.Aes;
+import io.github.robc.jroot.crypto.CaStore;
 import io.github.robc.jroot.crypto.Der;
 import io.github.robc.jroot.crypto.Pem;
+import io.github.robc.jroot.crypto.ProxySigner;
 import io.github.robc.jroot.crypto.RsaKeys;
 import io.github.robc.jroot.crypto.X509Proxy;
 
@@ -37,17 +40,25 @@ import io.github.robc.jroot.crypto.X509Proxy;
  *       proxy chain, encrypted under the session key.</li>
  * </ol>
  *
+ * <p>The server's certificate chain is checked against the CA directory
+ * before its key is used for anything, and a server that asks for a
+ * delegated proxy ({@code kXGS_pxyreq}) gets one signed here — but only if
+ * the client was told it may, since delegation hands the far end a
+ * credential carrying the user's identity.
+ *
  * <p>Not implemented, and refused by name rather than mis-answered: the
- * signed-DH path (the server offers {@code kXRS_cipher} instead of
- * {@code kXRS_puk}) and X.509 delegation ({@code kXGS_pxyreq}).
+ * signed-DH path, where the server offers {@code kXRS_cipher} instead of
+ * {@code kXRS_puk}.
  */
 public final class GsiCredential implements Credential {
 
     /** Advertised so the server chooses unsigned DH. Anything at or above
      *  {@code XrdSecgsiVersDHsigned} (10400) selects signed DH. */
     public static final int VERSION_UNSIGNED_DH = 10300;
-    /** A stock client's options, with proxy delegation off. */
-    public static final int CLIENT_OPTS_NO_DELEGATION = 0x80;
+    /** A stock client's default options. */
+    public static final int CLIENT_OPTS_DEFAULT = 0x80;
+    /** {@code kOptsSigReq}: this client will sign a proxy if asked for one. */
+    public static final int CLIENT_OPTS_SIGN_DELEGATION = 0x04;
     /** AES-128: the session key is the leading 16 bytes of the shared secret. */
     public static final int SESSION_KEY_LEN = 16;
     public static final int RTAG_LEN = 8;
@@ -60,20 +71,36 @@ public final class GsiCredential implements Credential {
     private final X509Proxy proxy;
     private final String cryptoModule;
     private final String issuerHash;
+    private final CaStore caStore;
+    private final boolean delegate;
     private final SecureRandom random = new SecureRandom();
     private byte[] rtag = new byte[0];
     private byte[] sessionKey;
+    private ProxySigner.Delegated delegated;
 
     public GsiCredential(X509Proxy proxy, String cryptoModule, String issuerHash) {
+        this(proxy, cryptoModule, issuerHash, null, false);
+    }
+
+    /**
+     * @param caStore where the server's chain must anchor, or {@code null} to
+     *                take it on trust — which is what {@code verifyPeer(false)}
+     *                asks for and nothing else should
+     * @param delegate whether to sign a proxy the server asks for
+     */
+    public GsiCredential(X509Proxy proxy, String cryptoModule, String issuerHash,
+                         CaStore caStore, boolean delegate) {
         this.proxy = proxy;
         this.cryptoModule = cryptoModule == null || cryptoModule.isBlank() ? "ssl" : cryptoModule;
         this.issuerHash = issuerHash == null ? "" : issuerHash;
+        this.caStore = caStore;
+        this.delegate = delegate;
     }
 
     /** Build a GSI credential from the proxy the environment points at, or
      *  empty when there is no usable one. */
-    public static Optional<GsiCredential> available(SecurityOffer offer, Path proxyPath) {
-        Path path = proxyPath != null ? proxyPath : X509Proxy.defaultPath();
+    public static Optional<GsiCredential> available(SecurityOffer offer, Config config) {
+        Path path = config.proxyPath() != null ? config.proxyPath() : X509Proxy.defaultPath();
         if (!Files.isReadable(path)) {
             return Optional.empty();
         }
@@ -89,7 +116,9 @@ public final class GsiCredential implements Credential {
         }
         var options = offer.options();
         return Optional.of(new GsiCredential(proxy,
-                options.getOrDefault("c", "ssl"), options.getOrDefault("ca", "")));
+                options.getOrDefault("c", "ssl"), options.getOrDefault("ca", ""),
+                config.verifyPeer() ? CaStore.discover(config.caPath()) : null,
+                config.delegateProxy()));
     }
 
     public X509Proxy proxy() {
@@ -115,7 +144,7 @@ public final class GsiCredential implements Credential {
         rtag = new byte[RTAG_LEN];
         random.nextBytes(rtag);
         return certreq(cryptoModule, VERSION_UNSIGNED_DH, issuerHash,
-                CLIENT_OPTS_NO_DELEGATION, rtag);
+                CLIENT_OPTS_DEFAULT | (delegate ? CLIENT_OPTS_SIGN_DELEGATION : 0), rtag);
     }
 
     @Override
@@ -125,8 +154,7 @@ public final class GsiCredential implements Credential {
             return certResponse(challenge);
         }
         if (step == GsiMessage.STEP_SERVER_PXYREQ) {
-            throw new XrdAuthException(
-                    "the server asked for X.509 delegation, which this client does not do");
+            return signDelegatedProxy(challenge);
         }
         throw new XrdAuthException("unexpected GSI step " + step + " from the server");
     }
@@ -155,6 +183,7 @@ public final class GsiCredential implements Credential {
             }
             throw new XrdAuthException("the server's GSI challenge carries no DH public key");
         }
+        verifyPeerChain(message);
         PeerPublic peer = parsePeerBlob(blob);
         BigInteger priv = privateExponent(peer.p());
         sessionKey = sessionKey(peer, priv);
@@ -181,6 +210,69 @@ public final class GsiCredential implements Credential {
                 Bucket.of(GsiMessage.BUCKET_CIPHER_ALG, "aes-128-cbc"),
                 Bucket.of(GsiMessage.BUCKET_MD_ALG, "sha256"),
                 new Bucket(GsiMessage.BUCKET_MAIN, encrypted)));
+    }
+
+    /**
+     * Check the chain the server offered against the CA directory. A server
+     * that sends none is left to TLS and to the far end's own authorisation
+     * to judge; one that sends a chain which does not anchor is refused here,
+     * before its key is used to agree anything.
+     *
+     * <p>What is <em>not</em> checked is the server's signature over this
+     * client's random tag: the padding XrdSecgsi uses there is not pinned
+     * down by anything this implementation could be written against, and a
+     * check that might pass wrongly is worse than none.
+     */
+    private void verifyPeerChain(GsiMessage.Decoded message) {
+        if (caStore == null) {
+            return;
+        }
+        byte[] pem = message.find(GsiMessage.BUCKET_X509);
+        if (pem == null || pem.length == 0) {
+            return;
+        }
+        caStore.verify(X509Proxy.parseChain(pem), "the server");
+    }
+
+    /**
+     * Answer {@code kXGS_pxyreq}: sign the PKCS#10 the server sent into a
+     * proxy one level below this client's own, and send back the chain.
+     *
+     * <p>The request arrives inside the encrypted main bucket, because by
+     * this point in the exchange there is a session key; a server that sends
+     * it in the clear is answered anyway, since the reply is encrypted either
+     * way and nothing secret is being read.
+     */
+    private byte[] signDelegatedProxy(byte[] challenge) {
+        if (!delegate) {
+            throw new XrdAuthException("the server asked for a delegated X.509 proxy;"
+                    + " this client will only sign one when it is configured to"
+                    + " (Config.withDelegateProxy)");
+        }
+        if (sessionKey == null) {
+            throw new XrdAuthException(
+                    "the server asked for a delegated proxy before agreeing a session key");
+        }
+        GsiMessage.Decoded message = GsiMessage.decode(challenge);
+        byte[] main = message.find(GsiMessage.BUCKET_MAIN);
+        byte[] request = main != null
+                ? GsiMessage.find(Aes.cbcDecrypt(sessionKey, main), GsiMessage.BUCKET_X509_REQ)
+                : message.find(GsiMessage.BUCKET_X509_REQ);
+        if (request == null || request.length == 0) {
+            throw new XrdAuthException("the server asked for a delegated proxy"
+                    + " without sending a certificate request to sign");
+        }
+        delegated = ProxySigner.sign(proxy, request);
+        byte[] inner = GsiMessage.encode(GsiMessage.STEP_CLIENT_SIGPXY,
+                List.of(new Bucket(GsiMessage.BUCKET_X509, delegated.pem())));
+        return GsiMessage.encode(GsiMessage.STEP_CLIENT_SIGPXY, List.of(
+                new Bucket(GsiMessage.BUCKET_MAIN, Aes.cbcEncrypt(sessionKey, inner))));
+    }
+
+    /** The proxy this client signed for the server, or {@code null} if none
+     *  was asked for. */
+    public ProxySigner.Delegated delegated() {
+        return delegated;
     }
 
     // -----------------------------------------------------------------
