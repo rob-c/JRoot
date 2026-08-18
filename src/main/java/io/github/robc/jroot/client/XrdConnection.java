@@ -270,7 +270,7 @@ public final class XrdConnection implements Closeable {
         if (offers.isEmpty()) {
             return;                                 // the server wants nobody named
         }
-        CredentialLadder ladder = CredentialLadder.build(offers, config);
+        CredentialLadder ladder = CredentialLadder.build(offers, config, url.host());
         if (ladder.isEmpty()) {
             throw new XrdAuthException(url.host() + " offered "
                     + offers.stream().map(SecurityOffer::name).toList()

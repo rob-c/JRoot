@@ -122,6 +122,20 @@ reporting only the last.
   appended — `bf32`, the same transform that then signs the session's
   requests. A server that names a key (`n:<name>`) gets that key or an error,
   never a different one.
+- **`krb5` — a Kerberos ticket.** The cache `kinit` wrote, named by
+  `--ccache`, `Config.withCredentialCache`, `$KRB5CCNAME` or
+  `/tmp/krb5cc_$UID`. The blob is `"krb5\0"` and then an AP-REQ for the
+  principal the server's offer names, or `xrootd/<host>` when it names none;
+  the realm in an offer is dropped, since Kerberos derives it from the
+  instance. The AP-REQ comes from the JDK's own GSS-API — still no
+  dependencies, and still the library the KDC's administrator tests against —
+  stripped of the RFC 2743 wrapper it arrives in, because the server hands
+  what follows the name straight to `krb5_rd_req`. The FILE cache format is
+  read here rather than delegated, which is what turns "authentication
+  failed" into "your ticket expired 40 minutes ago" before anything touches
+  the network; `Krb5Ccache.tickets` is public so a caller can ask the same
+  question. A server that asks for a forwarded ticket-granting ticket
+  (`fwdtgt`) is refused by name.
 - **`unix`** — the login name and group, for a server that asks for nothing
   better.
 
@@ -215,7 +229,7 @@ an upload survives the redirect intact.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 253 tests
+mvn test           # 272 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

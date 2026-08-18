@@ -95,6 +95,8 @@ public final class Cli {
                     case "--delegate" -> config = config.withDelegateProxy(true);
                     case "--keytab" -> config = config.withKeytab(
                             Path.of(value != null ? value : args[++i]));
+                    case "--ccache" -> config = config.withCredentialCache(
+                            Path.of(value != null ? value : args[++i]));
                     case "--streams" -> config = config.withDataStreams(
                             Integer.parseInt(value != null ? value : args[++i]));
                     case "--timeout" -> config = config.withRequestTimeout(
@@ -428,6 +430,7 @@ public final class Cli {
                   --no-verify            do not verify the server certificate
                   --delegate             sign a proxy for a server that asks
                   --keytab PATH          an sss keytab (else $XrdSecSSSKT)
+                  --ccache PATH          a Kerberos cache (else $KRB5CCNAME)
                   --timeout SECONDS      how long one request may take
                   --streams N            TCP streams per root:// session (default 1)
                   -d, --debug            print stack traces

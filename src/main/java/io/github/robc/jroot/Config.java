@@ -36,12 +36,13 @@ public final class Config {
     private final int dataStreams;
     private final boolean delegateProxy;
     private final Path keytab;
+    private final Path credentialCache;
 
     private Config(String username, String token, Path proxyPath, Path caPath,
                    boolean allowUnix, boolean verifyPeer, Tls tls, List<String> mechanisms,
                    Duration connectTimeout, Duration requestTimeout,
                    int maxRedirects, int maxWaitSeconds, int dataStreams,
-                   boolean delegateProxy, Path keytab) {
+                   boolean delegateProxy, Path keytab, Path credentialCache) {
         this.username = username;
         this.token = token;
         this.proxyPath = proxyPath;
@@ -57,13 +58,14 @@ public final class Config {
         this.dataStreams = dataStreams;
         this.delegateProxy = delegateProxy;
         this.keytab = keytab;
+        this.credentialCache = credentialCache;
     }
 
     /** The defaults: whatever the environment already says, and nothing else. */
     public static Config defaults() {
         return new Config(System.getProperty("user.name", "nobody"), null, null, null,
                 true, true, Tls.AUTO, List.of(),
-                Duration.ofSeconds(30), Duration.ofMinutes(5), 16, 300, 1, false, null);
+                Duration.ofSeconds(30), Duration.ofMinutes(5), 16, 300, 1, false, null, null);
     }
 
     public String username() {
@@ -134,73 +136,73 @@ public final class Config {
     public Config withUsername(String value) {
         return new Config(value, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withToken(String value) {
         return new Config(username, value, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withProxyPath(Path value) {
         return new Config(username, token, value, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withCaPath(Path value) {
         return new Config(username, token, proxyPath, value, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withAllowUnix(boolean value) {
         return new Config(username, token, proxyPath, caPath, value, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withVerifyPeer(boolean value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, value, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withTls(Tls value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, value,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withMechanisms(List<String> value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 value, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withConnectTimeout(Duration value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, value, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withRequestTimeout(Duration value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, value, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withMaxRedirects(int value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, value, maxWaitSeconds,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     public Config withMaxWaitSeconds(int value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, value,
-                dataStreams, delegateProxy, keytab);
+                dataStreams, delegateProxy, keytab, credentialCache);
     }
 
     /** Clamped to 1..{@value io.github.robc.jroot.wire.XrdConst#MAX_DATA_PATHS}+1:
@@ -209,7 +211,7 @@ public final class Config {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
                 Math.max(1, Math.min(value, io.github.robc.jroot.wire.XrdConst.MAX_DATA_PATHS + 1)),
-                delegateProxy, keytab);
+                delegateProxy, keytab, credentialCache);
     }
 
     /**
@@ -225,7 +227,7 @@ public final class Config {
     public Config withDelegateProxy(boolean value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, value, keytab);
+                dataStreams, value, keytab, credentialCache);
     }
 
     /**
@@ -240,7 +242,21 @@ public final class Config {
     public Config withKeytab(Path value) {
         return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
                 mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
-                dataStreams, delegateProxy, value);
+                dataStreams, delegateProxy, value, credentialCache);
+    }
+
+    /**
+     * The Kerberos credential cache, or null to look where MIT and Heimdal
+     * look: {@code $KRB5CCNAME}, then {@code /tmp/krb5cc_<uid>}.
+     */
+    public Path credentialCache() {
+        return credentialCache;
+    }
+
+    public Config withCredentialCache(Path value) {
+        return new Config(username, token, proxyPath, caPath, allowUnix, verifyPeer, tls,
+                mechanisms, connectTimeout, requestTimeout, maxRedirects, maxWaitSeconds,
+                dataStreams, delegateProxy, keytab, value);
     }
 
     @Override

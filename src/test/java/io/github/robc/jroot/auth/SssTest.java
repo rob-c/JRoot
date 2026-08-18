@@ -283,11 +283,11 @@ class SssTest {
         Path path = keytab(directory, "0 u:x g:x N:1 k:0102030405060708\n");
         List<SecurityOffer> offers = SecurityOffer.parse("&P=sss&P=unix");
         Config config = Config.defaults().withKeytab(path);
-        CredentialLadder ladder = CredentialLadder.build(offers, config);
+        CredentialLadder ladder = CredentialLadder.build(offers, config, "store.example.org");
         assertEquals("sss", ladder.candidates().get(0).credential().name());
 
         CredentialLadder without = CredentialLadder.build(offers,
-                Config.defaults().withKeytab(directory.resolve("absent")));
+                Config.defaults().withKeytab(directory.resolve("absent")), "store.example.org");
         assertTrue(without.explain().contains("no shared-secret keytab"), without.explain());
     }
 

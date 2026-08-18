@@ -61,15 +61,17 @@ public final class CredentialLadder {
     /**
      * Build the ladder for {@code offers}. A configured mechanism list
      * reorders and filters what the server offered; without one the server's
-     * own order stands, which is how it expresses preference.
+     * own order stands, which is how it expresses preference. {@code host} is
+     * the server being talked to, which is what {@code krb5} names its
+     * service principal after when the offer does not name one.
      */
-    public static CredentialLadder build(List<SecurityOffer> offers, Config config) {
+    public static CredentialLadder build(List<SecurityOffer> offers, Config config, String host) {
         List<SecurityOffer> ordered = order(offers, config.mechanisms());
         List<Candidate> candidates = new ArrayList<>();
         Map<String, String> rejections = new LinkedHashMap<>();
         for (SecurityOffer offer : ordered) {
             try {
-                Optional<? extends Credential> credential = build(offer, config);
+                Optional<? extends Credential> credential = build(offer, config, host);
                 if (credential.isPresent()) {
                     candidates.add(new Candidate(offer, credential.get()));
                 } else {
@@ -84,11 +86,13 @@ public final class CredentialLadder {
         return new CredentialLadder(candidates, rejections);
     }
 
-    private static Optional<? extends Credential> build(SecurityOffer offer, Config config) {
+    private static Optional<? extends Credential> build(SecurityOffer offer, Config config,
+                                                        String host) {
         return switch (offer.name()) {
             case "ztn" -> TokenCredential.available(offer, config.token());
             case "gsi" -> GsiCredential.available(offer, config);
             case "sss" -> SssCredential.available(offer, config);
+            case "krb5" -> Krb5Credential.available(offer, config, host);
             case "unix" -> config.allowUnix()
                     ? Optional.of(new UnixCredential(config.username(), config.username()))
                     : Optional.empty();
@@ -103,6 +107,7 @@ public final class CredentialLadder {
             case "gsi" -> "no readable X.509 proxy at "
                     + io.github.robc.jroot.crypto.X509Proxy.defaultPath();
             case "sss" -> "no shared-secret keytab at " + SssKeytab.defaultPath();
+            case "krb5" -> "no Kerberos credential cache at " + Krb5Ccache.defaultPath();
             case "unix" -> "unix authentication was turned off in this client";
             default -> "this client does not implement " + mechanism;
         };
