@@ -318,7 +318,8 @@ public final class XrdConnection implements Closeable {
                         && protocol.securityOverrides().isEmpty()) {
             return;
         }
-        signer = new Signer(key, protocol.securityLevel(), protocol.securityOverrides(),
+        signer = new Signer(key, credential.sessionCipher(), protocol.securityLevel(),
+                protocol.securityOverrides(),
                 (protocol.securityOptions() & XrdConst.kXR_secOData) != 0, false);
     }
 

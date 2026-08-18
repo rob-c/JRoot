@@ -88,6 +88,7 @@ public final class CredentialLadder {
         return switch (offer.name()) {
             case "ztn" -> TokenCredential.available(offer, config.token());
             case "gsi" -> GsiCredential.available(offer, config);
+            case "sss" -> SssCredential.available(offer, config);
             case "unix" -> config.allowUnix()
                     ? Optional.of(new UnixCredential(config.username(), config.username()))
                     : Optional.empty();
@@ -101,6 +102,7 @@ public final class CredentialLadder {
                     + TokenCredential.searchPath();
             case "gsi" -> "no readable X.509 proxy at "
                     + io.github.robc.jroot.crypto.X509Proxy.defaultPath();
+            case "sss" -> "no shared-secret keytab at " + SssKeytab.defaultPath();
             case "unix" -> "unix authentication was turned off in this client";
             default -> "this client does not implement " + mechanism;
         };

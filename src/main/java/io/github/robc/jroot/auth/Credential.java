@@ -1,5 +1,7 @@
 package io.github.robc.jroot.auth;
 
+import io.github.robc.jroot.crypto.Signer;
+
 /**
  * One authentication mechanism, ready to run. A credential is pure state:
  * it turns the server's security trailer into bytes and consumes challenges,
@@ -29,5 +31,15 @@ public interface Credential {
      */
     default byte[] sessionKey() {
         return null;
+    }
+
+    /**
+     * The cipher that key is used under. Each mechanism brings its own: GSI
+     * agrees an AES key over Diffie-Hellman, where {@code sss} has nothing to
+     * agree and signs with the shared secret itself, under the same
+     * {@code bf32} its credential was minted with.
+     */
+    default Signer.Cipher sessionCipher() {
+        return Signer.Cipher.AES_CBC;
     }
 }

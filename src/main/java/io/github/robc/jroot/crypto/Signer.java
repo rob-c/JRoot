@@ -25,6 +25,11 @@ import io.github.robc.jroot.wire.XrdConst;
  * data-bearing request ({@code kXR_write}, {@code kXR_pgwrite}) is hashed
  * <em>without</em> its payload unless the server negotiated
  * {@code kXR_secOData}, and the frame says so with {@code kXR_nodata_sig}.
+ *
+ * <p>Which cipher runs is the authenticated mechanism's business, not the
+ * protocol's: GSI signs under the AES key it agreed, and {@code sss} under
+ * {@code bf32} with the shared secret, the same transform that minted its
+ * credential.
  */
 public final class Signer {
 
@@ -46,7 +51,11 @@ public final class Signer {
     /** One signature, ready to be wrapped in a {@code kXR_sigver} request. */
     public record Signature(long sequence, byte[] bytes, boolean nodata) {}
 
+    /** The session ciphers a signature can be encrypted under. */
+    public enum Cipher { AES_CBC, BF32 }
+
     private final byte[] key;
+    private final Cipher cipher;
     private final int level;
     private final Map<Integer, Integer> overrides;
     private final boolean signData;
@@ -56,12 +65,18 @@ public final class Signer {
 
     public Signer(byte[] key, int level, Map<Integer, Integer> overrides,
                   boolean signData, boolean embeddedIv) {
+        this(key, Cipher.AES_CBC, level, overrides, signData, embeddedIv);
+    }
+
+    public Signer(byte[] key, Cipher cipher, int level, Map<Integer, Integer> overrides,
+                  boolean signData, boolean embeddedIv) {
         this.key = key.clone();
+        this.cipher = cipher;
         this.level = level;
         this.overrides = Map.copyOf(overrides);
         this.signData = signData;
         this.embeddedIv = embeddedIv;
-        this.random = embeddedIv ? new SecureRandom() : null;
+        this.random = embeddedIv && cipher == Cipher.AES_CBC ? new SecureRandom() : null;
     }
 
     /**
@@ -132,6 +147,18 @@ public final class Signer {
 
         boolean nodata = DATA_OPCODES.contains(opcode) && !signData;
         byte[] digest = hash(sequence, header, payload, nodata);
+        return new Signature(sequence, encrypt(digest), nodata);
+    }
+
+    /**
+     * The digest under the session cipher. {@code bf32} has no IV to choose
+     * and no padding to add — its output is the digest plus the four bytes of
+     * its CRC — so the signed-DH embedded IV simply does not arise there.
+     */
+    private byte[] encrypt(byte[] digest) {
+        if (cipher == Cipher.BF32) {
+            return Blowfish.bf32(key, digest);
+        }
         byte[] signature;
         if (embeddedIv) {
             byte[] iv = new byte[Aes.BLOCK_SIZE];
@@ -143,11 +170,12 @@ public final class Signer {
         } else {
             signature = Aes.cbcEncrypt(key, digest);
         }
-        return new Signature(sequence, signature, nodata);
+        return signature;
     }
 
     @Override
     public String toString() {
-        return "Signer[level=" + level + ", seqno=" + sequence + ", key=<redacted>]";
+        return "Signer[" + cipher + ", level=" + level + ", seqno=" + sequence
+                + ", key=<redacted>]";
     }
 }
