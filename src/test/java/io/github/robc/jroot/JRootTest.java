@@ -1,0 +1,299 @@
+package io.github.robc.jroot;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+import io.github.robc.jroot.http.MockHttpStorage;
+import io.github.robc.jroot.wire.Types.DirEntry;
+import io.github.robc.jroot.wire.Types.ReadVSegment;
+import io.github.robc.jroot.wire.Types.StatInfo;
+import io.github.robc.jroot.wire.XrdConst;
+
+/**
+ * The facade: which transport a URL picks, what the local one does, and what
+ * happens where two of them meet.
+ */
+@Timeout(30)
+class JRootTest {
+
+    private static final byte[] CONTENT =
+            "the quick brown fox jumps over the lazy dog".getBytes(StandardCharsets.UTF_8);
+
+    @TempDir
+    Path dir;
+
+    private JRoot jroot;
+
+    @BeforeEach
+    void open() {
+        jroot = JRoot.open();
+    }
+
+    @AfterEach
+    void close() {
+        jroot.close();
+    }
+
+    // -----------------------------------------------------------------
+    // Dispatch
+    // -----------------------------------------------------------------
+
+    @Test
+    void picksTheTransportFromTheScheme() {
+        assertEquals(JRoot.Transport.XROOTD, JRoot.transportOf("root://door//store/f"));
+        assertEquals(JRoot.Transport.XROOTD, JRoot.transportOf("xroots://door//store/f"));
+        assertEquals(JRoot.Transport.HTTP, JRoot.transportOf("https://door/store/f"));
+        assertEquals(JRoot.Transport.HTTP, JRoot.transportOf("davs://door/store/f"));
+        assertEquals(JRoot.Transport.LOCAL, JRoot.transportOf("file:///store/f"));
+        assertEquals(JRoot.Transport.LOCAL, JRoot.transportOf("/store/f"));
+        assertEquals(JRoot.Transport.LOCAL, JRoot.transportOf("relative/f"));
+    }
+
+    @Test
+    void refusesASchemeItCannotSpeak() {
+        XrdException failure =
+                assertThrows(XrdException.class, () -> JRoot.transportOf("gsiftp://door/f"));
+        assertTrue(failure.getMessage().contains("gsiftp"));
+    }
+
+    @Test
+    void takesAPathWithAColonInItForAPath() {
+        // A name may hold a colon; a scheme may not hold a slash before one.
+        assertEquals(JRoot.Transport.LOCAL, JRoot.transportOf("/data/run:1/f"));
+        assertEquals(Path.of("/data/run:1/f"), JRoot.localPath("/data/run:1/f"));
+    }
+
+    @Test
+    void readsAFileUrlBackToAPath() {
+        assertEquals(Path.of("/store/data/f"), JRoot.localPath("file:///store/data/f"));
+        assertEquals(Path.of("/store/data/f"), JRoot.localPath("/store/data/f"));
+        // file://host/path with a relative authority is how a URI spells a
+        // relative path; keep the authority as the first component.
+        assertEquals(Path.of("data/f"), JRoot.localPath("file://data/f"));
+    }
+
+    @Test
+    void handsBackTheSameClientEveryTime() {
+        assertTrue(jroot.xrootd() == jroot.xrootd());
+        assertTrue(jroot.webdav() == jroot.webdav());
+        assertTrue(jroot.http() == jroot.webdav(), "HTTP is the WebDAV client without the verbs");
+    }
+
+    // -----------------------------------------------------------------
+    // Local filesystem
+    // -----------------------------------------------------------------
+
+    @Test
+    void statsALocalFile() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        StatInfo stat = jroot.stat(file.toString());
+        assertEquals(CONTENT.length, stat.size());
+        assertFalse(stat.isDirectory());
+        assertEquals(file.toString(), stat.path());
+        assertTrue(jroot.stat(dir.toString()).isDirectory());
+        assertTrue(jroot.exists(file.toString()));
+        assertFalse(jroot.exists(dir.resolve("nothing").toString()));
+    }
+
+    @Test
+    void reportsAMissingLocalFileAsTheProtocolWould() {
+        String missing = dir.resolve("nothing").toString();
+        XrdServerException failure =
+                assertThrows(XrdServerException.class, () -> jroot.stat(missing));
+        assertEquals(XrdConst.kXR_NotFound, failure.code());
+        assertTrue(failure.isNotFound());
+        assertTrue(jroot.statIfPresent(missing).isEmpty());
+        assertTrue(jroot.statIfPresent(dir.toString()).isPresent());
+    }
+
+    @Test
+    void listsALocalDirectoryInOrder() throws IOException {
+        Files.write(dir.resolve("b"), CONTENT);
+        Files.write(dir.resolve("a"), new byte[3]);
+        Files.createDirectory(dir.resolve("c"));
+        List<DirEntry> entries = jroot.list(dir.toString());
+        assertEquals(List.of("a", "b", "c"), entries.stream().map(DirEntry::name).toList());
+        assertEquals(3, entries.get(0).stat().orElseThrow().size());
+        assertTrue(entries.get(2).isDirectory());
+    }
+
+    @Test
+    void readsALocalFileWholeAndInPieces() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        assertArrayEquals(CONTENT, jroot.read(file.toString()));
+        assertEquals("quick", new String(jroot.read(file.toString(), 4, 5),
+                StandardCharsets.UTF_8));
+        assertEquals("dog", new String(
+                jroot.read(file.toString(), CONTENT.length - 3, 100), StandardCharsets.UTF_8),
+                "a read past the end stops at the end");
+
+        List<ReadVSegment> segments = jroot.readV(file.toString(),
+                List.of(new long[] {4, 5}, new long[] {10, 5}));
+        assertEquals(2, segments.size());
+        assertEquals(10, segments.get(1).offset());
+        assertEquals("brown", new String(segments.get(1).data(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void writesALocalFileAndTheDirectoriesAboveIt() {
+        Path file = dir.resolve("new/deeper/f.root");
+        jroot.write(file.toString(), CONTENT);
+        assertArrayEquals(CONTENT, jroot.read(file.toString()));
+    }
+
+    @Test
+    void streamsALocalFileInChunks() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertEquals(CONTENT.length, jroot.stream(file.toString(), out));
+        assertArrayEquals(CONTENT, out.toByteArray());
+    }
+
+    @Test
+    void makesAndRemovesLocalDirectories() {
+        Path child = dir.resolve("a");
+        jroot.mkdir(child.toString());
+        assertTrue(Files.isDirectory(child));
+
+        XrdServerException exists =
+                assertThrows(XrdServerException.class, () -> jroot.mkdir(child.toString()));
+        assertEquals(XrdConst.kXR_ItExists, exists.code());
+
+        Path deep = dir.resolve("x/y/z");
+        assertThrows(XrdException.class, () -> jroot.mkdir(deep.toString()));
+        jroot.mkdir(deep.toString(), true);
+        assertTrue(Files.isDirectory(deep));
+
+        jroot.write(deep.resolve("f").toString(), CONTENT);
+        jroot.rmdir(dir.resolve("x").toString());
+        assertFalse(Files.exists(dir.resolve("x")), "rmdir takes the whole tree");
+    }
+
+    @Test
+    void removesALocalFile() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        jroot.rm(file.toString());
+        assertFalse(Files.exists(file));
+        XrdServerException failure =
+                assertThrows(XrdServerException.class, () -> jroot.rm(file.toString()));
+        assertEquals(XrdConst.kXR_NotFound, failure.code());
+    }
+
+    @Test
+    void reportsAPermissionDeniedAsTheProtocolWould() throws IOException {
+        Path file = dir.resolve("secret.root");
+        Files.write(file, CONTENT);
+        Files.setPosixFilePermissions(file, java.util.Set.of());
+        org.junit.jupiter.api.Assumptions.assumeTrue(!Files.isReadable(file),
+                "this user is not bound by file modes");
+
+        XrdServerException failure = assertThrows(XrdServerException.class,
+                () -> jroot.read(file.toString()));
+        assertEquals(XrdConst.kXR_NotAuthorized, failure.code());
+        assertTrue(failure.getMessage().contains("not permitted to read"));
+    }
+
+    @Test
+    void renamesWithinTheLocalFilesystem() throws IOException {
+        Path from = dir.resolve("from.root");
+        Path to = dir.resolve("to.root");
+        Files.write(from, CONTENT);
+        jroot.mv(from.toString(), to.toString());
+        assertFalse(Files.exists(from));
+        assertArrayEquals(CONTENT, Files.readAllBytes(to));
+    }
+
+    @Test
+    void refusesToRenameAcrossTransports() {
+        XrdException failure = assertThrows(XrdException.class,
+                () -> jroot.mv("root://door//store/f", dir.resolve("f").toString()));
+        assertTrue(failure.getMessage().contains("across transports"));
+        assertTrue(failure.getMessage().contains("copy then remove"));
+    }
+
+    @Test
+    void hasNoLocalChecksumToOffer() throws IOException {
+        Path file = dir.resolve("f.root");
+        Files.write(file, CONTENT);
+        assertTrue(jroot.checksum(file.toString()).isEmpty());
+    }
+
+    @Test
+    void copiesLocallyInChunks() throws IOException {
+        Path from = dir.resolve("from.root");
+        Path to = dir.resolve("sub/to.root");
+        byte[] large = new byte[3 * 1024 * 1024];
+        new java.util.Random(7).nextBytes(large);
+        Files.write(from, large);
+        jroot.copy(from.toString(), to.toString());
+        assertArrayEquals(large, Files.readAllBytes(to));
+    }
+
+    // -----------------------------------------------------------------
+    // Where two transports meet
+    // -----------------------------------------------------------------
+
+    @Test
+    void downloadsFromHttpToALocalFile() throws Exception {
+        try (MockHttpStorage server = new MockHttpStorage()) {
+            server.put("/store/f.root", CONTENT);
+            Path target = dir.resolve("f.root");
+            jroot.readTo(server.url("/store/f.root"), target);
+            assertArrayEquals(CONTENT, Files.readAllBytes(target));
+        }
+    }
+
+    @Test
+    void uploadsALocalFileOverHttp() throws Exception {
+        try (MockHttpStorage server = new MockHttpStorage()) {
+            Path source = dir.resolve("f.root");
+            Files.write(source, CONTENT);
+            jroot.writeFrom(source, server.url("/store/f.root"));
+            assertArrayEquals(CONTENT, server.contentOf("/store/f.root"));
+        }
+    }
+
+    @Test
+    void stagesACopyThatEndsAtAnHttpDestination() throws Exception {
+        try (MockHttpStorage server = new MockHttpStorage()) {
+            server.put("/store/from.root", CONTENT);
+            jroot.copy(server.url("/store/from.root"), server.url("/store/to.root"));
+            assertArrayEquals(CONTENT, server.contentOf("/store/to.root"));
+        }
+    }
+
+    @Test
+    void refusesAThirdPartyCopyThatIsNotHttpAtBothEnds() {
+        XrdException failure = assertThrows(XrdException.class,
+                () -> jroot.thirdPartyCopy("root://door//store/f", "https://other/store/f"));
+        assertTrue(failure.getMessage().contains("HTTP URL at both ends"));
+        assertThrows(XrdException.class,
+                () -> jroot.thirdPartyCopy("https://door/store/f", dir.resolve("f").toString()));
+    }
+
+    @Test
+    void saysWhatItIs() {
+        assertTrue(jroot.toString().startsWith("JRoot["));
+        assertTrue(JRoot.open(Config.defaults()).config() != null);
+    }
+}
