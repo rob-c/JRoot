@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
+import io.github.robc.jroot.transfer.Checksum;
+import io.github.robc.jroot.transfer.Transfer;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
@@ -18,6 +20,7 @@ import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.SpaceInfo;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
+import io.github.robc.jroot.zip.ZipArchive;
 
 /**
  * The command line: enough of one to use the library from a shell and to
@@ -39,6 +42,11 @@ public final class Cli {
     private boolean makePath;
     private boolean recursive;
     private boolean debug;
+    private boolean showProgress;
+    private boolean verifyChecksum = true;
+    private String algorithm = Checksum.DEFAULT;
+    private int parallel;
+    private int chunk;
 
     Cli(PrintStream out, PrintStream err) {
         this.out = out;
@@ -54,7 +62,7 @@ public final class Cli {
     // -----------------------------------------------------------------
 
     int run(String[] args) {
-        Config config = Config.defaults();
+        Config config = Config.fromEnvironment();
         List<String> operands = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -102,6 +110,12 @@ public final class Cli {
                             Integer.parseInt(value != null ? value : args[++i]));
                     case "--timeout" -> config = config.withRequestTimeout(
                             Duration.ofSeconds(Long.parseLong(value != null ? value : args[++i])));
+                    case "--parallel" -> parallel =
+                            Integer.parseInt(value != null ? value : args[++i]);
+                    case "--chunk" -> chunk = Integer.parseInt(value != null ? value : args[++i]);
+                    case "--checksum" -> algorithm = value != null ? value : args[++i];
+                    case "--no-checksum" -> verifyChecksum = false;
+                    case "--progress" -> showProgress = true;
                     default -> {
                         err.println("jroot: unknown option " + name);
                         usage(err);
@@ -182,10 +196,34 @@ public final class Cli {
                 require(args, 2, "cp SOURCE DEST");
                 if (recursive) {
                     jroot.copyTree(args.get(0), args.get(1));
+                    out.println(args.get(1) + ": written");
                 } else {
-                    jroot.copy(args.get(0), args.get(1));
+                    out.println(jroot.transfer().run(
+                            plan(jroot, args.subList(0, 1), args.get(1))));
                 }
-                out.println(args.get(1) + ": written");
+            }
+            case "xcp" -> {
+                require(args, 2, "xcp SOURCE... DEST");
+                List<String> sources = args.subList(0, args.size() - 1);
+                out.println(jroot.transfer().run(
+                        plan(jroot, sources, args.get(args.size() - 1))));
+            }
+            case "zip" -> {
+                require(args, 1, "zip URL");
+                try (ZipArchive archive = jroot.zip(args.get(0))) {
+                    for (ZipArchive.Member member : archive.members()) {
+                        out.printf("%12d  %12d  %s%n", member.size(),
+                                member.compressedSize(), member.name());
+                    }
+                }
+            }
+            case "unzip" -> {
+                require(args, 2, "unzip URL MEMBER");
+                try (ZipArchive archive = jroot.zip(args.get(0))) {
+                    byte[] member = archive.read(args.get(1));
+                    out.write(member, 0, member.length);
+                    out.flush();
+                }
             }
             case "tpc" -> {
                 require(args, 2, "tpc SOURCE DEST");
@@ -402,6 +440,47 @@ public final class Cli {
         return version != null ? version : "(development build)";
     }
 
+    /**
+     * A copy plan from the options given, on top of whatever the
+     * {@code XRD_*} environment already asked for.
+     */
+    private Transfer.Plan plan(JRoot jroot, List<String> sources, String target) {
+        Transfer.Plan plan = Transfer.plan(sources, target)
+                .withAlgorithm(algorithm)
+                .withVerify(verifyChecksum);
+        if (parallel > 0) {
+            plan = plan.withParallel(parallel);
+        }
+        if (chunk > 0) {
+            plan = plan.withChunkSize(chunk);
+        }
+        return showProgress ? plan.withProgress(this::progress) : plan;
+    }
+
+    /** One line, rewritten in place, so a long transfer says where it is. */
+    private void progress(long done, long total) {
+        if (total > 0) {
+            err.printf("\r%s of %s (%d%%)   ", bytes(done), bytes(total), done * 100 / total);
+        } else {
+            err.printf("\r%s   ", bytes(done));
+        }
+        if (done == total) {
+            err.println();
+        }
+    }
+
+    /** A byte count in the units a person reads, which is not always bytes. */
+    static String bytes(long count) {
+        String[] units = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
+        double scaled = count;
+        int unit = 0;
+        while (scaled >= 1024 && unit < units.length - 1) {
+            scaled /= 1024;
+            unit++;
+        }
+        return unit == 0 ? count + " B" : String.format("%.1f %s", scaled, units[unit]);
+    }
+
     private static void usage(PrintStream to) {
         to.println("""
                 jroot — an XRootD, XRootD-HTTP and WebDAV client
@@ -414,8 +493,11 @@ public final class Cli {
                   cat URL                write a file to standard output
                   get URL [DEST]         download a file
                   put FILE URL           upload a file
-                  cp SOURCE DEST         copy between any two URLs
+                  cp SOURCE DEST         copy between any two URLs, checksummed
+                  xcp SOURCE... DEST     copy from every replica at once
                   tpc SOURCE DEST        server-to-server copy
+                  zip URL                list the members of a ZIP archive
+                  unzip URL MEMBER       write one member to standard output
                   rm URL...              remove files (-r for whole trees)
                   mkdir URL...           create directories
                   rmdir URL...           remove directories
@@ -438,6 +520,14 @@ public final class Cli {
                   https://host/path               XRootD-HTTP
                   davs://host/path                WebDAV over TLS
                   /path or file:///path           the local filesystem
+                  URL?xrdcl.unzip=member          one member of a ZIP archive
+                  a .meta4 or .metalink file      every replica listed in it
+
+                environment:
+                  the XRD_* variables the reference client reads are honoured:
+                  XRD_REQUESTTIMEOUT, XRD_CONNECTIONWINDOW, XRD_REDIRECTLIMIT,
+                  XRD_SUBSTREAMSPERCHANNEL, XRD_STREAMTIMEOUT, XRD_TLSNOVERIFYCERT,
+                  XRD_CPCHUNKSIZE and XRD_CPPARALLELCHUNKS.
 
                 options:
                   -l, --long             a long listing
@@ -454,6 +544,11 @@ public final class Cli {
                   --ccache PATH          a Kerberos cache (else $KRB5CCNAME)
                   --timeout SECONDS      how long one request may take
                   --streams N            TCP streams per root:// session (default 1)
+                  --parallel N           chunks in flight during a copy (default 4)
+                  --chunk BYTES          how much one copy request moves
+                  --checksum ALG         verify a copy with this algorithm
+                  --no-checksum          do not verify a copy at all
+                  --progress             report a copy as it runs
                   -d, --debug            print stack traces
                   -V, --version          print the version
                   -h, --help             this text

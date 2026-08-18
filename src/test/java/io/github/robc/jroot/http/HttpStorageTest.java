@@ -147,7 +147,7 @@ class HttpStorageTest {
     void asksForAChecksumWithWantDigest() throws IOException {
         try (MockHttpStorage server = new MockHttpStorage().put("/data/file", CONTENT);
              HttpStorage storage = new HttpStorage(config())) {
-            assertEquals("adler32=0badcafe",
+            assertEquals("adler32=" + MockHttpStorage.adler32(CONTENT),
                     storage.checksum(server.url("/data/file"), "adler32").orElseThrow());
             assertEquals("adler32", server.headers().get(0).getFirst("Want-Digest"));
         }

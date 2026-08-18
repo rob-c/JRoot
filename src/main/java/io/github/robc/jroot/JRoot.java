@@ -26,6 +26,9 @@ import io.github.robc.jroot.client.XrdUrl;
 import io.github.robc.jroot.http.HttpStorage;
 import io.github.robc.jroot.http.TapeApi;
 import io.github.robc.jroot.http.WebDav;
+import io.github.robc.jroot.transfer.Sink;
+import io.github.robc.jroot.transfer.Source;
+import io.github.robc.jroot.transfer.Transfer;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.FattrItem;
@@ -33,6 +36,7 @@ import io.github.robc.jroot.wire.Types.PrepareStatus;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
+import io.github.robc.jroot.zip.ZipArchive;
 
 /**
  * One handle onto storage, whichever protocol reaches it.
@@ -60,6 +64,7 @@ public final class JRoot implements Closeable {
     private final Config config;
     private volatile XrdClient xrootd;
     private volatile TapeApi tape;
+    private volatile Transfer transfer;
     private volatile WebDav webdav;
 
     public JRoot() {
@@ -110,6 +115,25 @@ public final class JRoot implements Closeable {
             }
         }
         return client;
+    }
+
+    /**
+     * The copy engine: several replicas at once, failover between them, and
+     * a checksum comparison at the end. {@link #copy} is the plain byte pump;
+     * this is what {@code xrdcp} does with the same two URLs.
+     */
+    public Transfer transfer() {
+        Transfer engine = transfer;
+        if (engine == null) {
+            synchronized (this) {
+                engine = transfer;
+                if (engine == null) {
+                    engine = new Transfer(this);
+                    transfer = engine;
+                }
+            }
+        }
+        return engine;
     }
 
     /** The HTTP client, for callers that want {@code GET}/{@code PUT} without
@@ -357,11 +381,31 @@ public final class JRoot implements Closeable {
     // -----------------------------------------------------------------
 
     public byte[] read(String url) {
+        Optional<String> member = ZipArchive.memberOf(url);
+        if (member.isPresent()) {
+            try (ZipArchive archive = zip(url)) {
+                return archive.read(member.get());
+            }
+        }
         return switch (transportOf(url)) {
             case XROOTD -> xrootd().read(url);
             case HTTP -> webdav().read(url);
             case LOCAL -> localRead(localPath(url));
         };
+    }
+
+    /**
+     * A ZIP archive at {@code url}, read over the wire rather than fetched:
+     * its index comes back in three round trips and a member in one more.
+     *
+     * <p>The URL may carry the reference client's {@code ?xrdcl.unzip=}
+     * tag naming a member, which is stripped here and honoured by
+     * {@link #read(String)} — so a URL written for {@code xrdcp} reads the
+     * member it names rather than the archive around it.
+     */
+    public ZipArchive zip(String url) {
+        String archive = ZipArchive.archiveOf(url);
+        return ZipArchive.open(source(archive), archive);
     }
 
     /** A range: the point of a storage client, and the one operation every
@@ -796,24 +840,6 @@ public final class JRoot implements Closeable {
     // Copy plumbing
     // -----------------------------------------------------------------
 
-    /** A readable end of a copy: a size and random access to it. */
-    private interface Source extends Closeable {
-        long size();
-
-        byte[] read(long offset, int length);
-
-        @Override
-        void close();
-    }
-
-    /** A writable end of a copy: sequential, but told its offsets. */
-    private interface Sink extends Closeable {
-        void write(long offset, byte[] data);
-
-        @Override
-        void close();
-    }
-
     /**
      * How much of a copy chunk one stream carries. With a single stream that
      * is the whole chunk — splitting it would only add round trips — and with
@@ -825,7 +851,22 @@ public final class JRoot implements Closeable {
         return streams <= 1 ? COPY_CHUNK : Math.max(COPY_CHUNK / streams, 1 << 20);
     }
 
-    private Source source(String url) {
+    /**
+     * A random-access reader for any URL this facade understands. The caller
+     * closes it; a {@code root://} source holds an open file until it does,
+     * where an HTTP one is stateless and each range is its own request.
+     */
+    public Source source(String url) {
+        Optional<String> member = ZipArchive.memberOf(url);
+        if (member.isPresent()) {
+            ZipArchive archive = zip(url);
+            try {
+                return archive.source(member.get());
+            } catch (RuntimeException e) {
+                archive.close();
+                throw e;
+            }
+        }
         return switch (transportOf(url)) {
             case XROOTD -> {
                 XrdFile file = xrootd().open(url);
@@ -865,7 +906,12 @@ public final class JRoot implements Closeable {
         };
     }
 
-    private Sink sink(String url) {
+    /**
+     * A random-access writer for any URL this facade can write in pieces —
+     * every transport but HTTP, whose {@code PUT} is one request for the
+     * whole object.
+     */
+    public Sink sink(String url) {
         return switch (transportOf(url)) {
             case XROOTD -> {
                 XrdFile file = xrootd().create(url, XrdConst.DEFAULT_FILE_MODE);

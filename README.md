@@ -37,6 +37,31 @@ try (JRoot jroot = JRoot.open()) {
 }
 ```
 
+A copy is a transfer in its own right, not a read followed by a write: it
+draws chunks from every replica at once, steps past the ones that will not
+answer, and checks what landed against what the source says it should be.
+
+```java
+Transfer.Result result = jroot.transfer().copy(
+        List.of("root://door1.example.org//store/f.root",     // the same file,
+                "root://door2.example.org//store/f.root"),    // two sites
+        "/scratch/f.root");
+System.out.println(result);       // 4294967296 bytes to /scratch/f.root in 61.3s
+                                  // (66.8 MB/s), adler32 verified
+
+jroot.transfer().run(Transfer.plan(List.of(source), target)
+        .withParallel(16)
+        .withChunkSize(32 << 20)
+        .withAlgorithm("crc32c")
+        .withProgress((done, total) -> bar.update(done, total)));
+```
+
+A lone `root://` source is asked of its redirector first, so a manager's
+answer to `kXR_locate` becomes the list of data servers to read from — one
+file, several sockets, several machines. A `.meta4` source is fetched and
+unfolded into its replicas in the publisher's priority order, and the hash
+the metalink carries becomes what the copy is checked against.
+
 `root://`, `roots://`, `xroot://` and `xroots://` go over the binary protocol;
 `http(s)://`, `dav://` and `davs://` over HTTP and WebDAV; a bare path or
 `file://` is the local filesystem, so a copy always has somewhere to land.
@@ -87,7 +112,19 @@ $ jroot xattr root://door.example.org//store/f.root user.checksum
 $ jroot prepare root://door.example.org//store/data/file.root
 $ jroot prepstat 7f3a root://door.example.org//store/data/file.root
 $ jroot locality davs://webdav.example.org/store/data/file.root
+$ jroot --progress --parallel 16 xcp root://a//store/f root://b//store/f /scratch/f
+$ jroot cp --checksum crc32c root://door//store/f.root /scratch/f.root
+$ jroot cp https://data.example.org/f.root.meta4 /scratch/f.root
+$ jroot zip root://door//store/bundle.zip
+$ jroot unzip root://door//store/bundle.zip data/histograms.root > histograms.root
+$ jroot get 'root://door//store/bundle.zip?xrdcl.unzip=data/histograms.root' /scratch/
 ```
+
+The `XRD_*` environment the reference client reads is read here too, so a
+site's worker-node tuning applies unchanged: `XRD_REQUESTTIMEOUT`,
+`XRD_CONNECTIONWINDOW`, `XRD_STREAMTIMEOUT`, `XRD_REDIRECTLIMIT`,
+`XRD_SUBSTREAMSPERCHANNEL`, `XRD_TLSNOVERIFYCERT`, `XRD_CPCHUNKSIZE` and
+`XRD_CPPARALLELCHUNKS`. Options given on the command line win.
 
 `jroot --help` lists every command and option.
 
@@ -232,6 +269,38 @@ answer in the same shape and the same words, so a caller that waits on
 one waits on the other unchanged, and a local file — already online, by
 definition — answers too.
 
+**Copying** — the transfer engine divides a file into chunks and pulls them
+in parallel from as many replicas as it was given, opening one more connection
+per chunk in flight and no more. A replica that will not open is dropped and
+the next one takes its share; a chunk that fails is retried on a different
+replica rather than the one that just refused it. Checksums are compared at
+the end, and the algorithm is whichever both ends will compute — the server
+is asked to compute its own where it can, so verification does not mean
+reading the file back across the network. A mismatch fails the copy loudly,
+since a copy that is not the file is worse than no copy. Where neither end
+will produce a checksum the transfer is reported unverified rather than
+failed, because plenty of storage carries no checksum at all.
+
+Verification is a second pass and not a running sum, deliberately: parallel
+chunks arrive out of order, and no streaming checksum can be fed out of
+order. An HTTP destination is written by one `PUT` of the whole object, so
+those copies land on local disk first and upload from there — the parallel
+read still pays for itself.
+
+**Metalink** — RFC 5854 (`.meta4`) and the older metalink 3, parsed into the
+replicas they name, sorted by the publisher's priority, with the strongest
+hash they carry taken as the expected checksum.
+
+**ZIP members over the wire** — an archive on a storage element is read
+through its own index rather than downloaded: the end-of-directory record,
+then the central directory, then the one member asked for, which is three
+requests regardless of how big the archive is. ZIP64 is understood, stored
+and deflated members alike, a range of a member is served by a range of the
+archive where the member is stored uncompressed, and every member read whole
+is checked against the CRC32 the directory recorded. `?xrdcl.unzip=member` on
+a URL — the same tag the reference client uses — reads a member anywhere a
+URL is accepted.
+
 ## Known limitations
 
 - **GSI signed Diffie-Hellman is not implemented.** A server that offers
@@ -249,7 +318,7 @@ definition — answers too.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 316 tests
+mvn test           # 372 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

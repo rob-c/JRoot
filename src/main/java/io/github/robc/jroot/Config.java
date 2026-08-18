@@ -4,6 +4,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 
+import io.github.robc.jroot.util.Env;
+
 /**
  * Everything a client can be told before it connects. Instances are
  * immutable; each {@code with*} method returns a new configuration, so one
@@ -66,6 +68,44 @@ public final class Config {
         return new Config(System.getProperty("user.name", "nobody"), null, null, null,
                 true, true, Tls.AUTO, List.of(),
                 Duration.ofSeconds(30), Duration.ofMinutes(5), 16, 300, 1, false, null, null);
+    }
+
+    /**
+     * The defaults, as the {@code XRD_*} environment already tunes them.
+     *
+     * <p>A site tunes the reference client by exporting these, and a job
+     * inherits the tuning from whatever submitted it. A Java client that
+     * ignored them would be quietly slower — or quietly less patient — than
+     * every other client on the same worker node, for no reason the operator
+     * could see. Anything unset, unreadable or out of range keeps its
+     * default rather than failing: the environment is advice.
+     */
+    public static Config fromEnvironment() {
+        Config config = defaults();
+        Duration connect = Env.seconds("XRD_CONNECTIONWINDOW");
+        if (connect != null) {
+            config = config.withConnectTimeout(connect);
+        }
+        Duration request = Env.seconds("XRD_REQUESTTIMEOUT");
+        if (request != null) {
+            config = config.withRequestTimeout(request);
+        }
+        int streams = Env.number("XRD_SUBSTREAMSPERCHANNEL", 1, 16);
+        if (streams > 0) {
+            config = config.withDataStreams(streams);
+        }
+        int redirects = Env.number("XRD_REDIRECTLIMIT", 1, 1024);
+        if (redirects > 0) {
+            config = config.withMaxRedirects(redirects);
+        }
+        int wait = Env.number("XRD_STREAMTIMEOUT", 1, 86400);
+        if (wait > 0) {
+            config = config.withMaxWaitSeconds(wait);
+        }
+        if (Env.flag("XRD_TLSNOVERIFYCERT")) {
+            config = config.withVerifyPeer(false);
+        }
+        return config;
     }
 
     public String username() {

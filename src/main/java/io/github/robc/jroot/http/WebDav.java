@@ -26,6 +26,7 @@ import org.xml.sax.SAXException;
 
 import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdException;
+import io.github.robc.jroot.util.Xml;
 import io.github.robc.jroot.XrdServerException;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.StatInfo;
@@ -338,27 +339,7 @@ public final class WebDav extends HttpStorage {
     }
 
     private static Document parseXml(byte[] body, URI uri) {
-        try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
-            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
-            factory.setNamespaceAware(true);
-            factory.setXIncludeAware(false);
-            factory.setExpandEntityReferences(false);
-            DocumentBuilder builder = factory.newDocumentBuilder();
-            builder.setEntityResolver((publicId, systemId) ->
-                    new org.xml.sax.InputSource(new java.io.StringReader("")));
-            return builder.parse(new ByteArrayInputStream(body));
-        } catch (ParserConfigurationException e) {
-            throw new XrdException("the JDK XML parser refused a safe configuration", e);
-        } catch (SAXException | IOException e) {
-            throw new XrdException("PROPFIND " + uri + " returned unreadable XML: "
-                    + e.getMessage(), e);
-        }
+        return Xml.parse(body, "PROPFIND " + uri);
     }
 
     private static Element child(Element parent, String name) {

@@ -186,10 +186,17 @@ public final class MockHttpStorage implements AutoCloseable {
         Headers headers = exchange.getResponseHeaders();
         headers.add("Last-Modified", "Tue, 15 Nov 2022 12:45:26 GMT");
         if (exchange.getRequestHeaders().containsKey("Want-Digest")) {
-            headers.add("Digest", "adler32=0badcafe");
+            headers.add("Digest", "adler32=" + adler32(content));
         }
         headers.add("Content-Length", String.valueOf(content == null ? 0 : content.length));
         exchange.sendResponseHeaders(200, -1);
+    }
+
+    /** What real storage answers Want-Digest with: the object's own checksum. */
+    public static String adler32(byte[] content) {
+        java.util.zip.Adler32 sum = new java.util.zip.Adler32();
+        sum.update(content == null ? new byte[0] : content);
+        return String.format("%08x", sum.getValue());
     }
 
     private void put(HttpExchange exchange, String path) throws IOException {
