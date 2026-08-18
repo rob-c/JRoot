@@ -13,6 +13,9 @@ import io.github.robc.jroot.XrdProtocolException;
  */
 public final class PagedIo {
 
+    /** The CRC and the two lengths in front of a checksum-error trailer. */
+    private static final int CSE_PREAMBLE = 8;
+
     private PagedIo() {}
 
     private static long crc(byte[] data, int off, int len) {
@@ -49,6 +52,35 @@ public final class PagedIo {
             pageLen = Math.min(XrdConst.kXR_pgPageSZ, data.length - pos);
         }
         return w.bytes();
+    }
+
+    /**
+     * The pages a {@code kXR_pgwrite} server reported corrupt, read out of
+     * the data that trails its {@code kXR_status} response.
+     *
+     * <p>The server writes what it was sent and then says which pages failed
+     * their checksum on the way in, as file offsets: it does not reject the
+     * request, so a client that ignores this leaves those pages wrong on
+     * disk. The trailer is a 4-byte CRC and two 2-byte lengths, then one
+     * big-endian int64 per bad page; an empty trailer means every page
+     * arrived intact.
+     */
+    public static long[] corruptPages(byte[] trailer) {
+        if (trailer.length == 0) {
+            return new long[0];
+        }
+        if (trailer.length < CSE_PREAMBLE || (trailer.length - CSE_PREAMBLE) % 8 != 0) {
+            throw new XrdProtocolException(
+                    "malformed kXR_pgwrite checksum-error trailer of " + trailer.length
+                            + " bytes: expected " + CSE_PREAMBLE + " plus eight per page");
+        }
+        RBuf r = new RBuf(trailer, "kXR_pgwrite checksum errors");
+        r.skip(CSE_PREAMBLE);
+        long[] pages = new long[(trailer.length - CSE_PREAMBLE) / 8];
+        for (int i = 0; i < pages.length; i++) {
+            pages[i] = r.i64();
+        }
+        return pages;
     }
 
     /**

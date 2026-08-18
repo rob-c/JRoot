@@ -157,6 +157,16 @@ authorises the parent authorises the children. Where a transport genuinely
 has no such notion — permission bits over HTTP, say — the call says so
 rather than pretending it worked.
 
+**Paged I/O with its retransmissions** — `kXR_pgread` verifies every 4 KiB
+page's CRC32C before a byte is returned, across however many `kXR_status`
+frames the server splits the answer into and from an offset that need not be
+on a page boundary. `kXR_pgwrite` is the interesting direction: a server that
+finds a page's checksum wrong writes the data anyway and answers with the
+offsets it could not trust, so the write is only finished once those pages
+have been sent again, with `kXR_pgRetry` set, and accepted. Ignoring that
+trailer — which is the easy thing to do, since the request did not fail —
+leaves the file quietly wrong on disk.
+
 **Multiple data streams** — `Config.withDataStreams(n)` binds `n-1` extra
 sockets to a session with `kXR_bind` when a file is first opened, and reads
 and writes are spread across them a chunk at a time. The frames are split the
@@ -205,7 +215,7 @@ an upload survives the redirect intact.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 243 tests
+mvn test           # 253 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

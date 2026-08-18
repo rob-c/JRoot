@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32C;
 
 import io.github.robc.jroot.wire.WBuf;
 import io.github.robc.jroot.wire.XrdConst;
@@ -80,10 +81,30 @@ final class MockXrootd implements AutoCloseable {
         }
     }
 
-    record Reply(int status, byte[] data) {
+    /** {@code trailer} is the raw data a {@code kXR_status} frame declares in
+     *  its own length and sends after itself, outside the response header. */
+    record Reply(int status, byte[] data, byte[] trailer) {
+
+        Reply(int status, byte[] data) {
+            this(status, data, new byte[0]);
+        }
 
         static Reply ok(byte[] data) {
             return new Reply(XrdConst.kXR_ok, data);
+        }
+
+        /**
+         * A {@code kXR_status} answer to {@code requestId}, with its checksum
+         * over everything behind it, and {@code trailer} following the frame.
+         */
+        static Reply status(int requestId, int responseType, byte[] info, byte[] trailer) {
+            byte[] body = new WBuf()
+                    .u16(0).u8(requestId - XrdConst.kXR_1stRequest).u8(responseType)
+                    .zeros(4).i32(trailer.length).raw(info).bytes();
+            CRC32C crc = new CRC32C();
+            crc.update(body, 0, body.length);
+            return new Reply(XrdConst.kXR_status,
+                    new WBuf().u32(crc.getValue()).raw(body).bytes(), trailer);
         }
 
         /** A partial answer: more frames follow on the same stream. */
@@ -252,7 +273,7 @@ final class MockXrootd implements AutoCloseable {
         }
         OutputStream link = replyLink(request, out);
         for (Reply reply : replies) {
-            send(link, streamId, reply.status(), reply.data());
+            send(link, streamId, reply.status(), reply.data(), reply.trailer());
         }
         return true;
     }
@@ -325,8 +346,14 @@ final class MockXrootd implements AutoCloseable {
 
     private void send(OutputStream out, int streamId, int status, byte[] data)
             throws IOException {
+        send(out, streamId, status, data, new byte[0]);
+    }
+
+    private void send(OutputStream out, int streamId, int status, byte[] data, byte[] trailer)
+            throws IOException {
         synchronized (out) {
-            out.write(new WBuf().u16(streamId).u16(status).i32(data.length).raw(data).bytes());
+            out.write(new WBuf().u16(streamId).u16(status).i32(data.length)
+                    .raw(data).raw(trailer).bytes());
             out.flush();
         }
     }

@@ -215,6 +215,9 @@ public final class XrdConst {
     public static final int kXR_addPeers   = 0x0001;
     public static final int kXR_refreshLoc = 0x0080;
     public static final int kXR_prefname   = 0x0100;
+    /** This locate is the prelude to a listing, so answer with the servers
+     *  that hold the directory rather than the ones that hold a file. */
+    public static final int kXR_4dirlist   = 0x0400;
     public static final int kXR_nowaitLoc  = 0x2000;
 
     // ---- kXR_prepare options ----

@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdException;
+import io.github.robc.jroot.XrdProtocolException;
 import io.github.robc.jroot.wire.PagedIo;
 import io.github.robc.jroot.wire.Requests;
 import io.github.robc.jroot.wire.Responses;
@@ -30,6 +31,9 @@ import io.github.robc.jroot.wire.XrdConst;
  * because the server that granted the handle is the only one that knows it.
  */
 public final class XrdFile implements Closeable {
+
+    /** How many times one page is resent before the link is called broken. */
+    private static final int PG_RETRIES = 3;
 
     private final XrdConnection connection;
     private final XrdUrl url;
@@ -276,11 +280,45 @@ public final class XrdFile implements Closeable {
         pgWrite(offset, data, 0);
     }
 
-    /** The same, down the bound path {@code pathid}. */
+    /**
+     * The same, down the bound path {@code pathid}.
+     *
+     * <p>A server that finds a page's checksum wrong writes the data anyway
+     * and answers with the offsets it could not trust, so the write is only
+     * finished once those pages have been sent again and accepted. The
+     * encoding here is never the culprit — what these report is corruption
+     * on the wire — so resending the same bytes is the whole of the cure,
+     * and a page that survives {@value #PG_RETRIES} attempts is a link worth
+     * failing on rather than writing over.
+     */
     public void pgWrite(long offset, byte[] data, int pathid) {
         check();
-        connection.request(new Requests.PgWrite(fhandle, offset,
+        ServerResponse response = connection.request(new Requests.PgWrite(fhandle, offset,
                 PagedIo.packPages(offset, data), 0, pathid));
+        for (long page : PagedIo.corruptPages(response.data())) {
+            resend(offset, data, page, pathid);
+        }
+    }
+
+    /** Drive one page the server rejected back to a clean answer. */
+    private void resend(long base, byte[] data, long page, int pathid) {
+        long from = page - base;
+        if (from < 0 || from >= data.length) {
+            throw new XrdProtocolException("the server reported a bad page at offset " + page
+                    + ", which is outside the " + data.length + " bytes written at " + base);
+        }
+        int at = (int) from;
+        byte[] bytes = new byte[PagedIo.firstPageLength(page, data.length - at)];
+        System.arraycopy(data, at, bytes, 0, bytes.length);
+        for (int attempt = 0; attempt < PG_RETRIES; attempt++) {
+            ServerResponse retry = connection.request(new Requests.PgWrite(fhandle, page,
+                    PagedIo.packPages(page, bytes), XrdConst.kXR_pgRetry, pathid));
+            if (PagedIo.corruptPages(retry.data()).length == 0) {
+                return;
+            }
+        }
+        throw new XrdProtocolException("the page at offset " + page + " was still corrupt after "
+                + PG_RETRIES + " retransmissions");
     }
 
     /** Several writes in one round trip. */
