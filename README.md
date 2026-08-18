@@ -94,7 +94,15 @@ List<CompletableFuture<StatInfo>> all = urls.stream()
 CompletableFuture.allOf(all.toArray(CompletableFuture[]::new)).join();
 ```
 
-Configuration is an immutable record with a `with…` for each field:
+A session that breaks under an open file is rebuilt rather than reported: the
+client reconnects to the same server, opens the same path again and repeats
+the request that failed, for as long as `withRecoveryWindow` allows. Every
+XRootD request carries its own offset, so repeating one writes the same bytes
+to the same place — which is what makes this safe here and not in a protocol
+with a cursor.
+
+Configuration is immutable, with a `with…` for each field and a builder for
+when several change together:
 
 ```java
 Config config = Config.defaults()
@@ -102,7 +110,18 @@ Config config = Config.defaults()
         .withTls(Config.Tls.REQUIRED)
         .withDataStreams(4)                        // TCP streams per root:// session
         .withRequestTimeout(Duration.ofSeconds(60));
+
+Config tuned = Config.fromEnvironment().toBuilder()
+        .appName("analysis")                       // what the site's monitoring records
+        .recoveryWindow(Duration.ofMinutes(2))     // how long a lost session is worth
+        .build();
 ```
+
+When a transfer goes wrong at three in the morning, `XRD_LOGLEVEL=Debug` —
+with `XRD_LOGFILE` and `XRD_LOGMASK` if the whole trace is too much — prints
+what the client decided and why: which server it was redirected to, which
+mechanism authenticated, which replica it gave up on, which session it
+rebuilt.
 
 ## Command line
 
@@ -129,13 +148,16 @@ $ jroot cp https://data.example.org/f.root.meta4 /scratch/f.root
 $ jroot zip root://door//store/bundle.zip
 $ jroot unzip root://door//store/bundle.zip data/histograms.root > histograms.root
 $ jroot get 'root://door//store/bundle.zip?xrdcl.unzip=data/histograms.root' /scratch/
+$ jroot --trace debug --appname analysis stat root://door.example.org//store/f
 ```
 
 The `XRD_*` environment the reference client reads is read here too, so a
 site's worker-node tuning applies unchanged: `XRD_REQUESTTIMEOUT`,
 `XRD_CONNECTIONWINDOW`, `XRD_STREAMTIMEOUT`, `XRD_REDIRECTLIMIT`,
-`XRD_SUBSTREAMSPERCHANNEL`, `XRD_TLSNOVERIFYCERT`, `XRD_CPCHUNKSIZE` and
-`XRD_CPPARALLELCHUNKS`. Options given on the command line win.
+`XRD_SUBSTREAMSPERCHANNEL`, `XRD_TLSNOVERIFYCERT`, `XRD_STREAMERRORWINDOW`,
+`XRD_APPNAME`, `XRD_INFO`, `XRD_CPCHUNKSIZE` and `XRD_CPPARALLELCHUNKS`, with
+the trace following `XRD_LOGLEVEL`, `XRD_LOGFILE` and `XRD_LOGMASK`. Options
+given on the command line win.
 
 `jroot --help` lists every command and option.
 
@@ -317,6 +339,24 @@ the data — so a copy that fails, or fails to verify, takes its destination
 away again, which is what `kXR_posc` asks a server to do and what `xrdcp`
 does for itself where the server will not.
 
+**Sessions that come back** — a data server restarts, a route drops, a
+firewall times an idle connection out; none of that is news to the file the
+job had open. The client reconnects to the same server, opens the same path
+again — without the flags that created it, which would empty it — and repeats
+the request that failed, until `XRD_STREAMERRORWINDOW` runs out. Threads that
+noticed the same break recover once between them. What cannot be rebuilt is
+not attempted: a checkpoint is state the lost server held, and a `kXR_clone`
+names a handle another file was granted, so both fail rather than quietly
+doing something else.
+
+**Saying who you are, and writing down what happened** — every session's
+`kXR_login` carries the CGI a site's monitoring reads: country, timezone,
+application name, free text, hostname and release. Without it a client is
+invisible in the reports an operator uses to find out which workload is
+hammering a pool. The trace on the other side of that is `XRD_LOGLEVEL`,
+`XRD_LOGFILE` and `XRD_LOGMASK`, with the reference client's five levels and
+per-topic masking, off and free until somebody asks for it.
+
 **Metalink** — RFC 5854 (`.meta4`) and the older metalink 3, parsed into the
 replicas they name, sorted by the publisher's priority, with the strongest
 hash they carry taken as the expected checksum.
@@ -348,7 +388,7 @@ URL is accepted.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 391 tests
+mvn test           # 415 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

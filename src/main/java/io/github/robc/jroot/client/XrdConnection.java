@@ -32,6 +32,7 @@ import io.github.robc.jroot.auth.Credential;
 import io.github.robc.jroot.auth.CredentialLadder;
 import io.github.robc.jroot.auth.SecurityOffer;
 import io.github.robc.jroot.crypto.Signer;
+import io.github.robc.jroot.util.Trace;
 import io.github.robc.jroot.wire.RBuf;
 import io.github.robc.jroot.wire.Requests;
 import io.github.robc.jroot.wire.ResponseHeader;
@@ -188,6 +189,7 @@ public final class XrdConnection implements Closeable {
             plain.setTcpNoDelay(true);
             plain.connect(new InetSocketAddress(url.host(), url.port()),
                     (int) config.connectTimeout().toMillis());
+            Trace.debug(Trace.CONNECTION, "connected to %s", url.serverKey());
             return plain;
         } catch (IOException e) {
             throw new XrdConnectionException(
@@ -208,6 +210,9 @@ public final class XrdConnection implements Closeable {
         r.i32();                                   // protocol version, superseded
         serverType = r.i32();
         protocol = Responses.parseProtocol(readSync(PROTOCOL_SID, null).data());
+        Trace.debug(Trace.CONNECTION, "%s: %s, protocol %d, tls %s", url.serverKey(),
+                isDataServer() ? "data server" : "manager", protocol.version(),
+                protocol.hasTls() ? (protocol.demandsTls() ? "required" : "available") : "no");
     }
 
     private boolean wantsTls() {
@@ -251,6 +256,8 @@ public final class XrdConnection implements Closeable {
             parameters.setEndpointIdentificationAlgorithm(config.verifyPeer() ? "HTTPS" : null);
             ssl.setSSLParameters(parameters);
             ssl.startHandshake();
+            Trace.info(Trace.CONNECTION, "%s: TLS up, %s %s", url.serverKey(),
+                    ssl.getSession().getProtocol(), ssl.getSession().getCipherSuite());
             return ssl;
         } catch (IOException e) {
             throw new XrdConnectionException(
@@ -261,8 +268,13 @@ public final class XrdConnection implements Closeable {
     private List<SecurityOffer> doLogin() {
         String username = !url.user().isEmpty() ? url.user() : config.username();
         int pid = (int) ProcessHandle.current().pid();
-        ServerResponse response = request(LOGIN_SID, new Requests.Login(username, pid, ""), config.requestTimeout());
+        String identity = ClientId.of(config);
+        Trace.debug(Trace.AUTH, "%s: logging in as %s (%s)", url.serverKey(), username, identity);
+        ServerResponse response = request(LOGIN_SID,
+                new Requests.Login(username, pid, identity), config.requestTimeout());
         login = Responses.parseLogin(response.data());
+        Trace.debug(Trace.AUTH, "%s: login accepted, security %s", url.serverKey(),
+                login.sec().isEmpty() ? "<none>" : login.sec());
         return SecurityOffer.parse(login.sec());
     }
 
@@ -279,11 +291,16 @@ public final class XrdConnection implements Closeable {
         Map<String, String> failures = new LinkedHashMap<>(ladder.rejections());
         for (CredentialLadder.Candidate candidate : ladder.candidates()) {
             try {
+                Trace.debug(Trace.AUTH, "%s: trying %s", url.serverKey(),
+                        candidate.credential().name());
                 runExchange(candidate.credential());
                 mechanism = candidate.credential().name();
+                Trace.info(Trace.AUTH, "%s: authenticated with %s", url.serverKey(), mechanism);
                 installSigner(candidate.credential());
                 return;
             } catch (XrdServerException | XrdAuthException | XrdProtocolException e) {
+                Trace.warn(Trace.AUTH, "%s: %s refused — %s", url.serverKey(),
+                        candidate.credential().name(), e.getMessage());
                 failures.put(candidate.credential().name(), e.getMessage());
             }
         }
@@ -421,6 +438,8 @@ public final class XrdConnection implements Closeable {
      * interleaved with another thread's.
      */
     private void transmit(int sid, XrdRequest request) {
+        Trace.dump(Trace.XROOTD, "%s: -> %s sid=%d", url.serverKey(),
+                XrdConst.requestName(request.opcode()), sid);
         DataPath path = pathFor(request);
         if (path == null) {
             synchronized (writeLock) {
@@ -596,11 +615,14 @@ public final class XrdConnection implements Closeable {
             // Registered before its reader starts: a request may name the path
             // as soon as this returns, and the reader only ever reads.
             paths.put(pathid, path);
+            Trace.debug(Trace.CONNECTION, "%s: bound data path %d", url.serverKey(), pathid);
             daemon(() -> readLoop(path.in, "data path " + pathid),
                     "jroot-" + url.host() + ":" + url.port() + "-path" + pathid);
             return true;
         } catch (IOException | XrdException e) {
             pathRefusal = e.getMessage();
+            Trace.warn(Trace.CONNECTION, "%s: no more data paths — %s",
+                    url.serverKey(), pathRefusal);
             closeQuietly(bound);
             return false;
         }
@@ -691,6 +713,8 @@ public final class XrdConnection implements Closeable {
             attention(source, body);
             return;
         }
+        Trace.dump(Trace.XROOTD, "%s: <- %s sid=%d, %d bytes", url.serverKey(),
+                XrdConst.statusName(header.status()), header.streamId(), body.length);
         Stream stream = streams.get(header.streamId());
         if (stream == null) {
             // A late answer to a request nobody is waiting for any more:
@@ -714,8 +738,12 @@ public final class XrdConnection implements Closeable {
                 stream.future.completeExceptionally(
                         new XrdServerException(error.code(), error.message()));
             }
-            case XrdConst.kXR_redirect -> stream.future.completeExceptionally(
-                    new XrdRedirectException(Responses.parseRedirect(body)));
+            case XrdConst.kXR_redirect -> {
+                RedirectInfo redirect = Responses.parseRedirect(body);
+                Trace.info(Trace.XROOTD, "%s: redirected to %s:%d", url.serverKey(),
+                        redirect.host(), redirect.actualPort());
+                stream.future.completeExceptionally(new XrdRedirectException(redirect));
+            }
             case XrdConst.kXR_status -> status(source, stream, body);
             default -> stream.future.completeExceptionally(new XrdProtocolException(
                     "unknown response status " + header.status() + " from " + url.host()));
@@ -885,6 +913,7 @@ public final class XrdConnection implements Closeable {
     }
 
     private XrdException fail(XrdException reason) {
+        Trace.warn(Trace.CONNECTION, "%s: %s", url.serverKey(), reason.getMessage());
         if (failure == null) {
             failure = reason;
         }

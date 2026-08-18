@@ -25,6 +25,7 @@ import io.github.robc.jroot.XrdException;
 import io.github.robc.jroot.XrdServerException;
 import io.github.robc.jroot.client.XrdUrl;
 import io.github.robc.jroot.util.Env;
+import io.github.robc.jroot.util.Trace;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
@@ -219,12 +220,16 @@ public final class Transfer {
             throw new XrdException("a copy needs a source");
         }
         long started = System.nanoTime();
+        Trace.info(Trace.COPY, "copying %s to %s, %d way%s", resolved.sources(),
+                resolved.target(), resolved.parallel(), resolved.parallel() == 1 ? "" : "s");
         try {
             long bytes = JRoot.transportOf(resolved.target()) == JRoot.Transport.HTTP
                     ? throughATemporaryFile(resolved)
                     : pull(resolved, resolved.target());
             Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
-            return verify(resolved, bytes, elapsed);
+            Result result = verify(resolved, bytes, elapsed);
+            Trace.info(Trace.COPY, "copied %s", result);
+            return result;
         } catch (RuntimeException e) {
             removeQuietly(resolved.target());
             throw e;
@@ -681,8 +686,10 @@ public final class Transfer {
                 String url = pending.poll();
                 try {
                     open.add(new Held(url, jroot.source(url)));
+                    Trace.debug(Trace.COPY, "reading from %s", url);
                     return;
                 } catch (XrdException e) {
+                    Trace.warn(Trace.COPY, "%s will not open: %s", url, e.getMessage());
                     lastFailure = e;
                     retryLater(url, e);
                 }
@@ -705,6 +712,7 @@ public final class Transfer {
             if (!open.remove(held)) {
                 return;                 // another thread got there first
             }
+            Trace.warn(Trace.COPY, "dropping %s after a failed read", held.url());
             try {
                 held.source().close();
             } catch (RuntimeException ignored) {

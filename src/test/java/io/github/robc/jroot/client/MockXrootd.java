@@ -358,6 +358,24 @@ final class MockXrootd implements AutoCloseable {
         }
     }
 
+    /**
+     * Close every session this server is holding, without stopping it. What
+     * a client sees is what a restarted daemon, a dropped route or a
+     * firewall with an idle timeout looks like: the socket ends mid-session
+     * and the next connection is accepted as if nothing had happened.
+     */
+    void dropConnections() {
+        for (Socket client : clients) {
+            try {
+                client.close();
+            } catch (IOException e) {
+                // already gone
+            }
+        }
+        clients.clear();
+        paths.clear();
+    }
+
     /** Send an unsolicited response on {@code streamId}, as a server does when
      *  it answers a {@code kXR_waitresp} later. */
     void push(int streamId, int status, byte[] data) throws IOException {

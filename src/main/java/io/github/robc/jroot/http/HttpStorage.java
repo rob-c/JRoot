@@ -25,6 +25,7 @@ import io.github.robc.jroot.XrdException;
 import io.github.robc.jroot.XrdServerException;
 import io.github.robc.jroot.auth.TokenCredential;
 import io.github.robc.jroot.client.TlsFactory;
+import io.github.robc.jroot.util.Trace;
 import io.github.robc.jroot.wire.Types;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
@@ -290,8 +291,11 @@ public class HttpStorage implements AutoCloseable {
         HttpRequest request = builder.build();
         for (int hop = 0; hop <= config.maxRedirects(); hop++) {
             HttpResponse<T> response;
+            Trace.debug(Trace.HTTP, "-> %s %s", request.method(), request.uri());
             try {
                 response = http.send(request, handler);
+                Trace.debug(Trace.HTTP, "<- %d %s %s", response.statusCode(),
+                        request.method(), request.uri());
             } catch (IOException e) {
                 throw new XrdConnectionException(request.method() + " " + request.uri()
                         + " failed: " + e.getMessage(), e);
@@ -314,6 +318,8 @@ public class HttpStorage implements AutoCloseable {
                         + " redirected to plain HTTP at " + target
                         + ", which would put credentials in clear");
             }
+            Trace.info(Trace.HTTP, "%s %s redirected to %s", request.method(),
+                    request.uri(), target);
             request = redirected(request, target, response.statusCode(), replayBody);
         }
         throw new XrdException(uri + " redirected more than " + config.maxRedirects() + " times");

@@ -1,6 +1,7 @@
 package io.github.robc.jroot.client;
 
 import java.io.Closeable;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
@@ -8,10 +9,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import io.github.robc.jroot.Config;
+import io.github.robc.jroot.XrdConnectionException;
 import io.github.robc.jroot.XrdException;
 import io.github.robc.jroot.XrdProtocolException;
+import io.github.robc.jroot.XrdServerException;
+import io.github.robc.jroot.util.Trace;
 import io.github.robc.jroot.wire.PagedIo;
 import io.github.robc.jroot.wire.Requests;
 import io.github.robc.jroot.wire.Responses;
@@ -20,6 +25,7 @@ import io.github.robc.jroot.wire.Types.OpenInfo;
 import io.github.robc.jroot.wire.Types.ReadVSegment;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.XrdConst;
+import io.github.robc.jroot.wire.XrdRequest;
 
 /**
  * An open file on one data server.
@@ -29,23 +35,48 @@ import io.github.robc.jroot.wire.XrdConst;
  * at once, exactly as the protocol allows. The handle belongs to the
  * connection it was opened on: a file is not followed across a redirect,
  * because the server that granted the handle is the only one that knows it.
+ *
+ * <p>A session that breaks under an open file is rebuilt rather than
+ * reported, for as long as {@link Config#recoveryWindow()} allows: the
+ * client reconnects to the same server, opens the same path again, and
+ * repeats the request that failed. Every request carries its own offset, so
+ * repeating one writes the same bytes to the same place — which is what
+ * makes recovery safe here and not in a protocol with a cursor. What cannot
+ * be rebuilt is not attempted: a checkpoint is state the lost server held, a
+ * clone names another file's handle, and both fail rather than quietly doing
+ * something else.
  */
 public final class XrdFile implements Closeable {
 
     /** How many times one page is resent before the link is called broken. */
     private static final int PG_RETRIES = 3;
 
-    private final XrdConnection connection;
+    /** How long to leave a server that just dropped us before trying again. */
+    private static final Duration RETRY_PAUSE = Duration.ofSeconds(2);
+
+    private final XrdClient client;
     private final XrdUrl url;
-    private final byte[] fhandle;
     private final OpenInfo info;
+    private final int options;
+    private final int mode;
+    private final Object recoveryLock = new Object();
+
+    private volatile Session session;
     private volatile boolean closed;
 
-    XrdFile(XrdConnection connection, XrdUrl url, OpenInfo info) {
-        this.connection = connection;
+    /** The connection a file is open on and the handle that server granted.
+     *  Neither means anything without the other, and recovery replaces both
+     *  at once. */
+    private record Session(XrdConnection connection, byte[] fhandle) { }
+
+    XrdFile(XrdClient client, XrdConnection connection, XrdUrl url, OpenInfo info,
+            int options, int mode) {
+        this.client = client;
         this.url = url;
-        this.fhandle = info.fhandle();
         this.info = info;
+        this.options = options;
+        this.mode = mode;
+        this.session = new Session(connection, info.fhandle());
     }
 
     public XrdUrl url() {
@@ -85,7 +116,7 @@ public final class XrdFile implements Closeable {
         if (length < 0) {
             throw new IllegalArgumentException("cannot read " + length + " bytes");
         }
-        return connection.request(new Requests.Read(fhandle, offset, length, pathid)).data();
+        return call(handle -> new Requests.Read(handle, offset, length, pathid)).data();
     }
 
     /**
@@ -94,7 +125,7 @@ public final class XrdFile implements Closeable {
      * which is the default and what {@link Config#dataStreams()} raises.
      */
     public int[] streams() {
-        int[] paths = connection.dataPaths();
+        int[] paths = session.connection().dataPaths();
         int[] all = new int[paths.length + 1];
         System.arraycopy(paths, 0, all, 1, paths.length);
         return all;
@@ -208,13 +239,15 @@ public final class XrdFile implements Closeable {
         check();
         List<ReadVSegment> out = new ArrayList<>();
         for (int start = 0; start < ranges.size(); start += XrdConst.VEC_MAXSEGS) {
-            List<Requests.Segment> segments = new ArrayList<>();
-            for (long[] range : ranges.subList(start,
-                    Math.min(start + XrdConst.VEC_MAXSEGS, ranges.size()))) {
-                segments.add(new Requests.Segment(fhandle, range[0], (int) range[1]));
-            }
-            out.addAll(Responses.parseReadV(
-                    connection.request(new Requests.ReadV(segments)).data()));
+            List<long[]> batch = ranges.subList(start,
+                    Math.min(start + XrdConst.VEC_MAXSEGS, ranges.size()));
+            out.addAll(Responses.parseReadV(call(handle -> {
+                List<Requests.Segment> segments = new ArrayList<>();
+                for (long[] range : batch) {
+                    segments.add(new Requests.Segment(handle, range[0], (int) range[1]));
+                }
+                return new Requests.ReadV(segments);
+            }).data()));
         }
         return out;
     }
@@ -222,8 +255,7 @@ public final class XrdFile implements Closeable {
     /** Read with per-page CRC32C protection, verified before returning. */
     public byte[] pgRead(long offset, int length) {
         check();
-        ServerResponse response =
-                connection.request(new Requests.PgRead(fhandle, offset, length));
+        ServerResponse response = call(handle -> new Requests.PgRead(handle, offset, length));
         return PagedIo.unpackPages(offset, response.data());
     }
 
@@ -235,7 +267,7 @@ public final class XrdFile implements Closeable {
      *  instead of the control link. */
     public void write(long offset, byte[] data, int pathid) {
         check();
-        connection.request(new Requests.Write(fhandle, offset, data, pathid));
+        call(handle -> new Requests.Write(handle, offset, data, pathid));
     }
 
     /**
@@ -293,7 +325,7 @@ public final class XrdFile implements Closeable {
      */
     public void pgWrite(long offset, byte[] data, int pathid) {
         check();
-        ServerResponse response = connection.request(new Requests.PgWrite(fhandle, offset,
+        ServerResponse response = call(handle -> new Requests.PgWrite(handle, offset,
                 PagedIo.packPages(offset, data), 0, pathid));
         for (long page : PagedIo.corruptPages(response.data())) {
             resend(offset, data, page, pathid);
@@ -311,7 +343,7 @@ public final class XrdFile implements Closeable {
         byte[] bytes = new byte[PagedIo.firstPageLength(page, data.length - at)];
         System.arraycopy(data, at, bytes, 0, bytes.length);
         for (int attempt = 0; attempt < PG_RETRIES; attempt++) {
-            ServerResponse retry = connection.request(new Requests.PgWrite(fhandle, page,
+            ServerResponse retry = call(handle -> new Requests.PgWrite(handle, page,
                     PagedIo.packPages(page, bytes), XrdConst.kXR_pgRetry, pathid));
             if (PagedIo.corruptPages(retry.data()).length == 0) {
                 return;
@@ -324,18 +356,20 @@ public final class XrdFile implements Closeable {
     /** Several writes in one round trip. */
     public void writeV(List<Object[]> chunks, boolean sync) {
         check();
-        List<Requests.WriteSegment> segments = new ArrayList<>();
-        for (Object[] chunk : chunks) {
-            segments.add(new Requests.WriteSegment(fhandle,
-                    (Long) chunk[0], (byte[]) chunk[1]));
-        }
-        connection.request(new Requests.WriteV(segments, sync));
+        call(handle -> {
+            List<Requests.WriteSegment> segments = new ArrayList<>();
+            for (Object[] chunk : chunks) {
+                segments.add(new Requests.WriteSegment(handle,
+                        (Long) chunk[0], (byte[]) chunk[1]));
+            }
+            return new Requests.WriteV(segments, sync);
+        });
     }
 
     /** Flush this file's data to storage. */
     public void sync() {
         check();
-        connection.request(new Requests.Sync(fhandle));
+        call(handle -> new Requests.Sync(handle));
     }
 
     /**
@@ -345,12 +379,12 @@ public final class XrdFile implements Closeable {
      */
     public void syncWithin(java.time.Duration timeout) {
         check();
-        connection.request(new Requests.Sync(fhandle), timeout);
+        call(handle -> new Requests.Sync(handle), timeout);
     }
 
     public void truncate(long size) {
         check();
-        connection.request(new Requests.Truncate("", size, fhandle));
+        call(handle -> new Requests.Truncate("", size, handle));
     }
 
     // -----------------------------------------------------------------
@@ -365,46 +399,48 @@ public final class XrdFile implements Closeable {
      */
     public void checkpoint() {
         check();
-        connection.request(Requests.Chkpoint.begin(fhandle));
+        session.connection().request(Requests.Chkpoint.begin(session.fhandle()));
     }
 
     /** Make the checkpointed writes permanent and drop the undo data. */
     public void commit() {
         check();
-        connection.request(Requests.Chkpoint.commit(fhandle));
+        session.connection().request(Requests.Chkpoint.commit(session.fhandle()));
     }
 
     /** Undo everything written since {@link #checkpoint()}. */
     public void rollback() {
         check();
-        connection.request(Requests.Chkpoint.rollback(fhandle));
+        session.connection().request(Requests.Chkpoint.rollback(session.fhandle()));
     }
 
     /** How much more this file may write under the open checkpoint. */
     public Types.ChkpointLimits checkpointLimits() {
         check();
-        return Responses.parseChkpoint(
-                connection.request(Requests.Chkpoint.query(fhandle)).data());
+        return Responses.parseChkpoint(session.connection()
+                .request(Requests.Chkpoint.query(session.fhandle())).data());
     }
 
     /** A write that the open checkpoint can undo. */
     public void writeChecked(long offset, byte[] data) {
         check();
-        connection.request(Requests.Chkpoint.exec(fhandle,
-                new Requests.Write(fhandle, offset, data)));
+        Session on = session;
+        on.connection().request(Requests.Chkpoint.exec(on.fhandle(),
+                new Requests.Write(on.fhandle(), offset, data)));
     }
 
     /** A truncate that the open checkpoint can undo. */
     public void truncateChecked(long size) {
         check();
-        connection.request(Requests.Chkpoint.exec(fhandle,
-                new Requests.Truncate("", size, fhandle)));
+        Session on = session;
+        on.connection().request(Requests.Chkpoint.exec(on.fhandle(),
+                new Requests.Truncate("", size, on.fhandle())));
     }
 
     public StatInfo stat() {
         check();
         return Responses.parseStat(
-                connection.request(new Requests.Stat("", 0, fhandle)).data(), path());
+                call(handle -> new Requests.Stat("", 0, handle)).data(), path());
     }
 
     // -----------------------------------------------------------------
@@ -414,7 +450,7 @@ public final class XrdFile implements Closeable {
     /** The server's handle for this file, copied: the array on the wire is
      *  the connection's and must not be edited under it. */
     public byte[] handle() {
-        return fhandle.clone();
+        return session.fhandle().clone();
     }
 
     /**
@@ -436,14 +472,15 @@ public final class XrdFile implements Closeable {
     /** Several ranges of one file, {@code {sourceOffset, length, offset}} each. */
     public void cloneFrom(XrdFile source, List<long[]> ranges) {
         check();
-        if (source.connection != connection) {
+        if (source.session.connection() != session.connection()) {
             throw new XrdException(source.path() + " is open on another connection than "
                     + path() + "; a file handle means nothing to a server that did not"
                     + " grant it");
         }
         List<Requests.CloneItem> items = new ArrayList<>();
         for (long[] range : ranges) {
-            items.add(new Requests.CloneItem(source.fhandle, range[0], range[1], range[2]));
+            items.add(new Requests.CloneItem(source.session.fhandle(),
+                    range[0], range[1], range[2]));
         }
         cloneFrom(items);
     }
@@ -452,8 +489,9 @@ public final class XrdFile implements Closeable {
      *  connection. Longer lists are split at the server's own item limit. */
     public void cloneFrom(List<Requests.CloneItem> items) {
         check();
+        Session on = session;
         for (int start = 0; start < items.size(); start += XrdConst.CLONE_MAXITEMS) {
-            connection.request(new Requests.Clone(fhandle, items.subList(start,
+            on.connection().request(new Requests.Clone(on.fhandle(), items.subList(start,
                     Math.min(start + XrdConst.CLONE_MAXITEMS, items.size()))));
         }
     }
@@ -464,7 +502,134 @@ public final class XrdFile implements Closeable {
             return;
         }
         closed = true;
-        connection.request(new Requests.Close(fhandle));
+        Session on = session;
+        try {
+            on.connection().request(new Requests.Close(on.fhandle()));
+        } catch (XrdConnectionException e) {
+            // The handle went when the session did; there is nothing left to
+            // give back, and a caller closing a file should not learn about
+            // the link that way.
+            Trace.debug(Trace.XROOTD, "%s: closed with the session already gone (%s)",
+                    path(), e.getMessage());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Talking to the server, and going back for the session when it breaks
+    // -----------------------------------------------------------------
+
+    /**
+     * Send one request built around this file's handle, rebuilding the
+     * session first if the link is what failed.
+     *
+     * <p>The request is built from the handle rather than handed in already
+     * built, because after recovery the handle is a different one: the
+     * server that granted the first has gone, and the request has to be made
+     * again against the second.
+     */
+    private ServerResponse call(Function<byte[], XrdRequest> build) {
+        return call(build, null);
+    }
+
+    /** The same, for a request the server may sit on longer than usual. */
+    private ServerResponse call(Function<byte[], XrdRequest> build, Duration timeout) {
+        Session current = session;
+        try {
+            return send(current, build, timeout);
+        } catch (XrdConnectionException e) {
+            return send(recover(current, e), build, timeout);
+        }
+    }
+
+    private static ServerResponse send(Session on, Function<byte[], XrdRequest> build,
+                                       Duration timeout) {
+        XrdRequest request = build.apply(on.fhandle());
+        return timeout == null ? on.connection().request(request)
+                : on.connection().request(request, timeout);
+    }
+
+    /**
+     * Open this file again on a new connection to the same server, and keep
+     * trying until {@link Config#recoveryWindow()} runs out.
+     *
+     * <p>Only the link is worth waiting on. A server that answers — with
+     * "no such file", with "not authorised", with a redirect somewhere it
+     * would rather this client went — has told us something that will not
+     * change in the next two seconds, so its answer ends the attempt instead
+     * of starting another.
+     *
+     * <p>Threads that failed together recover once: the first through takes
+     * the lock, and the others find the session already replaced and use it.
+     */
+    private Session recover(Session stale, XrdConnectionException cause) {
+        if (closed || client == null || client.config().recoveryWindow().isZero()) {
+            throw cause;
+        }
+        Duration window = client.config().recoveryWindow();
+        synchronized (recoveryLock) {
+            if (session != stale) {
+                return session;                     // somebody else has been here
+            }
+            long deadline = System.nanoTime() + window.toNanos();
+            XrdException last = cause;
+            for (int attempt = 1; ; attempt++) {
+                Trace.warn(Trace.CONNECTION, "%s: session lost (%s); reopening, attempt %d",
+                        path(), last.getMessage(), attempt);
+                try {
+                    Session rebuilt = reopen();
+                    Trace.info(Trace.CONNECTION, "%s: session rebuilt on %s",
+                            path(), rebuilt.connection().url().serverKey());
+                    session = rebuilt;
+                    return rebuilt;
+                } catch (XrdServerException | XrdRedirectException e) {
+                    throw new XrdConnectionException(path() + " lost its session, and "
+                            + url.serverKey() + " will not open it again: " + e.getMessage(), e);
+                } catch (XrdException e) {
+                    last = e;
+                }
+                if (System.nanoTime() + RETRY_PAUSE.toNanos() >= deadline) {
+                    throw new XrdConnectionException(path() + " could not be reopened within "
+                            + window.toSeconds() + "s of losing its session: "
+                            + last.getMessage(), last);
+                }
+                pause();
+            }
+        }
+    }
+
+    /** The same path, on the same server, opened afresh. */
+    private Session reopen() {
+        XrdConnection fresh = client.connection(url);
+        OpenInfo reopened = Responses.parseOpen(fresh.request(
+                new Requests.Open(url.pathWithCgi(), reopenOptions(), mode)).data(), url.path());
+        fresh.ensureDataPaths();
+        return new Session(fresh, reopened.fhandle());
+    }
+
+    /**
+     * What to open with the second time. Everything about creating the file
+     * is dropped: it exists by now, and asking for it to be made new — or
+     * deleted first — would throw away every byte written before the link
+     * broke, which is the one outcome recovery exists to avoid.
+     */
+    private int reopenOptions() {
+        int creation = XrdConst.kXR_delete | XrdConst.kXR_new | XrdConst.kXR_mkpath;
+        return (options & ~creation) | (isWriting() ? XrdConst.kXR_open_updt : 0);
+    }
+
+    private boolean isWriting() {
+        int writes = XrdConst.kXR_open_updt | XrdConst.kXR_open_wrto
+                | XrdConst.kXR_open_apnd | XrdConst.kXR_delete | XrdConst.kXR_new;
+        return (options & writes) != 0;
+    }
+
+    private static void pause() {
+        try {
+            Thread.sleep(RETRY_PAUSE.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new XrdConnectionException("interrupted while rebuilding a lost session", e);
+        }
     }
 
     private void check() {

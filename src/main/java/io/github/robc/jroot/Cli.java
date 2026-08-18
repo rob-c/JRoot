@@ -13,6 +13,8 @@ import java.util.Locale;
 
 import io.github.robc.jroot.transfer.Checksum;
 import io.github.robc.jroot.transfer.Transfer;
+import io.github.robc.jroot.util.Trace;
+import io.github.robc.jroot.util.Version;
 import io.github.robc.jroot.wire.Types.ChecksumInfo;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.LocationInfo;
@@ -63,6 +65,11 @@ public final class Cli {
 
     int run(String[] args) {
         Config config = Config.fromEnvironment();
+        if (config.appName().isEmpty()) {
+            // Sites read this to tell one workload from another, and a
+            // command line that says nothing is invisible in their reports.
+            config = config.withAppName(Version.NAME);
+        }
         List<String> operands = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -90,7 +97,14 @@ public final class Cli {
                     case "-l", "--long" -> longListing = true;
                     case "-p", "--parents" -> makePath = true;
                     case "-r", "-R", "--recursive" -> recursive = true;
-                    case "-d", "--debug" -> debug = true;
+                    case "-d", "--debug" -> {
+                        debug = true;
+                        trace(Trace.Level.DEBUG);
+                    }
+                    case "--trace" -> trace(Trace.Level.parse(
+                            value != null ? value : args[++i], Trace.Level.DEBUG));
+                    case "--appname" -> config = config.withAppName(
+                            value != null ? value : args[++i]);
                     case "--token" -> config = config.withToken(value != null ? value : args[++i]);
                     case "--proxy" -> config = config.withProxyPath(
                             Path.of(value != null ? value : args[++i]));
@@ -150,6 +164,11 @@ public final class Cli {
             }
             return 1;
         }
+    }
+
+    /** Send the trace to standard error, so it cannot land in a piped file. */
+    private void trace(Trace.Level level) {
+        Trace.configure(level, err, java.util.Set.of());
     }
 
     private static Config.Tls tlsMode(String value) {
@@ -443,8 +462,7 @@ public final class Cli {
     }
 
     static String version() {
-        String version = Cli.class.getPackage().getImplementationVersion();
-        return version != null ? version : "(development build)";
+        return Version.number();
     }
 
     /**
@@ -536,7 +554,9 @@ public final class Cli {
                   the XRD_* variables the reference client reads are honoured:
                   XRD_REQUESTTIMEOUT, XRD_CONNECTIONWINDOW, XRD_REDIRECTLIMIT,
                   XRD_SUBSTREAMSPERCHANNEL, XRD_STREAMTIMEOUT, XRD_TLSNOVERIFYCERT,
-                  XRD_CPCHUNKSIZE and XRD_CPPARALLELCHUNKS.
+                  XRD_STREAMERRORWINDOW, XRD_APPNAME, XRD_INFO, XRD_CPCHUNKSIZE
+                  and XRD_CPPARALLELCHUNKS; the trace follows XRD_LOGLEVEL,
+                  XRD_LOGFILE and XRD_LOGMASK.
 
                 options:
                   -l, --long             a long listing
@@ -558,7 +578,9 @@ public final class Cli {
                   --checksum ALG         verify a copy with this algorithm
                   --no-checksum          do not verify a copy at all
                   --progress             report a copy as it runs
-                  -d, --debug            print stack traces
+                  -d, --debug            print stack traces and trace the protocol
+                  --trace LEVEL          trace at error, warning, info, debug or dump
+                  --appname NAME         what to call this workload to a server
                   -V, --version          print the version
                   -h, --help             this text
                 """);

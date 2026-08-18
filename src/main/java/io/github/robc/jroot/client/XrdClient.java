@@ -422,7 +422,7 @@ public final class XrdClient implements Closeable {
             // the server that granted the handle is the one worth binding
             // extra streams to.
             connection.ensureDataPaths();
-            return new XrdFile(connection, at, info);
+            return new XrdFile(this, connection, at, info, options, mode);
         });
     }
 
