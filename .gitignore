@@ -1,0 +1,17 @@
+target/
+*.class
+*.jar
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+bin/
+
+# credentials, which must never be committed
+*.pem
+*.p12
+x509up_*
