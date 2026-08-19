@@ -6,15 +6,19 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import io.github.robc.jroot.Config;
 import io.github.robc.jroot.XrdServerException;
+import io.github.robc.jroot.util.Trace;
 import io.github.robc.jroot.wire.Types.DirEntry;
 import io.github.robc.jroot.wire.Types.StatInfo;
 import io.github.robc.jroot.wire.WBuf;
@@ -234,5 +238,34 @@ class XrdClientTest {
                     .filter(opcode -> opcode == XrdConst.kXR_login).count();
             assertEquals(1, logins, "three operations should share one session");
         }
+    }
+
+    /**
+     * A server hanging up while we say goodbye is what a normal close looks
+     * like from the reader thread, and warning about it teaches everyone
+     * reading a log to ignore the one line that would matter if it appeared
+     * for real. Here the server drops the link instead of answering
+     * {@code kXR_endsess}, which is the worst case: the goodbye never lands.
+     */
+    @Test
+    void closesWithoutComplainingAboutTheServerHangingUp() throws IOException {
+        ByteArrayOutputStream written = new ByteArrayOutputStream();
+        Trace.configure(Trace.Level.DUMP,
+                new PrintStream(written, true, StandardCharsets.UTF_8), Set.of());
+        try (MockXrootd server = new MockXrootd()) {
+            server.on(XrdConst.kXR_endsess, request -> {
+                server.dropConnections();
+                return List.of();
+            });
+            try (XrdClient client = new XrdClient(config())) {
+                client.ping(server.url("/data"));
+            }
+        } finally {
+            Trace.fromEnvironment();
+        }
+        String trace = written.toString(StandardCharsets.UTF_8);
+        assertTrue(trace.contains("ended during shutdown"), trace);
+        assertFalse(trace.contains("[Warning]"), trace);
+        assertFalse(trace.contains("[Error]"), trace);
     }
 }

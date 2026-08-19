@@ -388,7 +388,7 @@ URL is accepted.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 418 tests
+mvn test           # 419 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a

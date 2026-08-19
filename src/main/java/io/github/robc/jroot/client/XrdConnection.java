@@ -94,6 +94,7 @@ public final class XrdConnection implements Closeable {
     private Thread reader;
 
     private volatile boolean closed;
+    private volatile boolean closing;
     private volatile XrdException failure;
     private int nextSid = FIRST_SID;
 
@@ -696,7 +697,12 @@ public final class XrdConnection implements Closeable {
                 dispatch(source, header, readFully(source, header.dataLength()));
             }
         } catch (IOException e) {
-            if (!closed) {
+            if (closed || closing) {
+                // The far end hanging up while we are saying goodbye is the
+                // shape of a normal close, not news to warn anybody about.
+                Trace.debug(Trace.CONNECTION, "%s: the %s ended during shutdown: %s",
+                        url.serverKey(), what, e.getMessage());
+            } else {
                 fail(new XrdConnectionException("the " + what + " to " + url.host()
                         + " ended: " + e.getMessage(), e));
             }
@@ -876,6 +882,7 @@ public final class XrdConnection implements Closeable {
         if (closed) {
             return;
         }
+        closing = true;
         if (login != null && isOpen()) {
             try {
                 request(new Requests.EndSession(login.sessionId()));
