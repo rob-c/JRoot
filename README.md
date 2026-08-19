@@ -388,7 +388,7 @@ URL is accepted.
 
 ```
 mvn package        # target/jroot-0.1.0-SNAPSHOT.jar, executable
-mvn test           # 415 tests
+mvn test           # 418 tests
 ```
 
 The tests are not mocks of JRoot's own classes. The XRootD tests run against a
@@ -398,6 +398,23 @@ mis-declared length fails the test instead of passing through a stub. The GSI
 tests are the same: real certificates, a real Diffie-Hellman exchange and a
 real PKCS#10, with the test playing the server's half, so the two ends have to
 agree on a key rather than be told they did.
+
+There is one thing all of that cannot catch: a client and a server written
+from the same reading of the spec agree with each other whether or not the
+reading is right. So `GsiInteropTest` puts the client in front of the official
+`xrootd` — a throwaway CA, host certificate and X.509 proxy minted by
+`xrdgsiproxy`, a server bound to `sec.protbind * only gsi`, all set up by
+`src/test/resources/it/xrootd-gsi-server.sh` — and carries a file up and back
+over `root://`, once with ordinary reads and writes and once with `kXR_writev`
+and `kXR_readv`. What arrived is compared against the server's own copy on
+disk, not only against what the client reads back. That test skips, and only
+skips, when the official tools are not installed:
+
+```
+mvn test -Dtest=GsiInteropTest     # needs xrootd, xrdgsiproxy and openssl
+src/test/resources/it/xrootd-gsi-server.sh start /tmp/xrd 21094   # by hand
+src/test/resources/it/xrootd-gsi-server.sh stop  /tmp/xrd
+```
 
 ## Licence
 
